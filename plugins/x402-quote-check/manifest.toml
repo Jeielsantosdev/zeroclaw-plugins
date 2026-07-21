@@ -1,0 +1,11 @@
+name = "x402-quote-check"
+version = "0.1.0"
+description = "Fetch an x402-gated resource, parse the HTTP 402 payment requirements, and return a GO/NO-GO verdict against operator policy (network, mint, amount cap, payTo shape, timeout cap). Never pays. T0, read-only."
+author = "ZeroClaw Labs"
+wasm_path = "x402_quote_check.wasm"
+capabilities = ["tool"]
+# http_client: GET the resource to trigger the 402 challenge.
+# config_read: the host injects this plugin's own config section (expected
+# network, known USDC mint, per-call amount cap, timeout cap) as `__config`.
+# Without it the plugin still works with conservative defaults.
+permissions = ["http_client", "config_read"]
