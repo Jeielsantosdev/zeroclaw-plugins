@@ -13,5 +13,6 @@
 //! transaction) is not yet implemented — that is the next unit of work. This
 //! crate intentionally does not yet export a `tool-plugin` component.
 
+pub mod rpc_history;
 pub mod transaction;
 pub mod x402_settle;
