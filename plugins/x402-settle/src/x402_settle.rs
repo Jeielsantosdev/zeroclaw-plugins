@@ -18,6 +18,8 @@
 
 use std::collections::HashMap;
 
+use zeroize::Zeroize;
+
 pub const DEFAULT_MAINNET_USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 pub const DEFAULT_MAX_AMOUNT_ATOMIC: u64 = 5_000_000;
 pub const DEFAULT_MAX_TIMEOUT_SECONDS: u64 = 300;
@@ -534,12 +536,21 @@ pub fn decode_session_key_seed(raw_base58: &str) -> Result<[u8; 32], String> {
             raw_base58.len()
         ));
     }
-    let bytes = bs58::decode(raw_base58)
+    let mut bytes = bs58::decode(raw_base58)
         .into_vec()
         .map_err(|e| format!("session key is not valid base58: {e}"))?;
-    bytes
-        .try_into()
-        .map_err(|_| "session key must decode to exactly 32 bytes".to_string())
+    // The decoded secret bytes live in this Vec's heap allocation regardless
+    // of whether decoding ultimately succeeds (wrong length) or not — scrub
+    // it on every exit from this point on, not just the happy path. Found
+    // during a zeroize audit: earlier code let this Vec drop normally.
+    if bytes.len() != 32 {
+        bytes.zeroize();
+        return Err("session key must decode to exactly 32 bytes".to_string());
+    }
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(&bytes);
+    bytes.zeroize();
+    Ok(seed)
 }
 
 /// The session key's public key, derived from its seed. Safe to log — unlike

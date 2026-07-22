@@ -27,6 +27,8 @@ mod component {
     use std::collections::HashMap;
     use std::time::Duration;
 
+    use zeroize::Zeroize;
+
     use crate::rpc_history::extract_outgoing_transfer;
     use crate::transaction::{build_signed_transaction, to_base64};
     use crate::x402_settle::{
@@ -144,7 +146,7 @@ mod component {
                     "session_token_account must be configured (see README limitations)".to_string(),
                 ));
             };
-            let Some(session_key_raw) = parsed.config.get("session_key").cloned() else {
+            let Some(mut session_key_raw) = parsed.config.get("session_key").cloned() else {
                 emit(
                     PluginAction::Fail,
                     PluginOutcome::Failure,
@@ -152,8 +154,14 @@ mod component {
                 );
                 return Ok(deny("session_key must be configured".to_string()));
             };
-            let seed = match decode_session_key_seed(&session_key_raw) {
-                Ok(s) => s,
+            let decoded_seed = decode_session_key_seed(&session_key_raw);
+            // The config String has served its purpose the moment decoding is
+            // attempted, whether it succeeded or not — scrub it here rather
+            // than let it drop normally at the end of scope. Found during a
+            // zeroize audit: this was previously left for ordinary Drop.
+            session_key_raw.zeroize();
+            let seed = match decoded_seed {
+                Ok(s) => zeroize::Zeroizing::new(s),
                 Err(e) => {
                     emit(
                         PluginAction::Fail,
@@ -163,6 +171,10 @@ mod component {
                     return Ok(deny(format!("malformed session_key: {e}")));
                 }
             };
+            // `seed` is `Zeroizing<[u8; 32]>` from here on: it derefs to
+            // `[u8; 32]` everywhere it's used below, and is scrubbed on drop
+            // no matter which of `execute`'s many early-return paths fires
+            // after this point — not just the success path.
             let fee_payer_pubkey = session_key_pubkey(&seed);
 
             // Step 1: fetch the resource, expect a 402 challenge.
