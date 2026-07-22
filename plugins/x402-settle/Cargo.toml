@@ -19,6 +19,8 @@ bs58 = "0.5"
 # default-features off: no rand_core/getrandom needed, signing is deterministic.
 # "zeroize" scrubs the session key bytes from memory once the SigningKey drops.
 ed25519-dalek = { version = "2", default-features = false, features = ["fast", "zeroize"] }
+# alloc-only: no std-only extras needed to base64-encode the signed transaction.
+base64 = { version = "0.22", default-features = false, features = ["alloc"] }
 
 [target.'cfg(target_family = "wasm")'.dependencies]
 waki = { version = "0.5.1", features = ["json"] }

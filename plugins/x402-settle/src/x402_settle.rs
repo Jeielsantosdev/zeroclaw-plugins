@@ -32,7 +32,7 @@ pub const CUMULATIVE_WINDOW_SECONDS: i64 = 24 * 60 * 60;
 /// The SPL Token program ID (mainnet and devnet share this address).
 pub const SPL_TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 /// Instruction tag for `spl_token::instruction::TokenInstruction::Transfer`.
-const SPL_TOKEN_TRANSFER_TAG: u8 = 3;
+pub(crate) const SPL_TOKEN_TRANSFER_TAG: u8 = 3;
 
 // ---------------------------------------------------------------------------
 // Requirement parsing and policy validation (duplicated from x402-quote-check)
