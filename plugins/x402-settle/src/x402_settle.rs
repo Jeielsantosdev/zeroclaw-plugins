@@ -53,6 +53,17 @@ impl SolanaCluster {
             other => SolanaCluster::Other(other.to_string()),
         }
     }
+
+    /// The canonical x402 spec v2 network label for this cluster, used when
+    /// building the outgoing `X-Payment` payload. Always the spec's own
+    /// naming convention, regardless of which shape the *inbound* 402 used.
+    pub fn network_label(&self) -> &str {
+        match self {
+            SolanaCluster::Mainnet => "solana-mainnet",
+            SolanaCluster::Devnet => "solana-devnet",
+            SolanaCluster::Other(raw) => raw,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -63,6 +74,12 @@ pub struct PaymentRequirement {
     pub pay_to: String,
     pub max_timeout_seconds: Option<u64>,
     pub source_shape: &'static str,
+}
+
+impl PaymentRequirement {
+    pub fn network_label(&self) -> &str {
+        self.network.network_label()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -188,12 +205,24 @@ pub struct SettlePolicyConfig {
     pub max_amount_atomic: u64,
     pub max_timeout_seconds: u64,
     pub max_cumulative_atomic_24h: u64,
+    /// Operator-configured RPC endpoint. Not a secret — safe in `Debug`.
+    /// No hardcoded default: unlike the mint/network/caps, there is no safe
+    /// generic default RPC endpoint, so its absence is a hard error at the
+    /// shim level, not a silently-assumed value.
+    pub rpc_url: Option<String>,
+    /// The session's own SPL token account for the accepted mint — the
+    /// `source` in every transfer this plugin builds. Not a secret. **Known
+    /// limitation (v0.1):** this must be supplied by the operator; the
+    /// associated-token-account address is not derived on-chain here (that
+    /// requires a `find_program_address`-style PDA search, deliberately out
+    /// of scope for this first pass — see the README's "Roadmap").
+    pub session_token_account: Option<String>,
 }
 
 impl SettlePolicyConfig {
     /// Build from the flat `string -> string` section the host injects.
     /// Deliberately never reads the session key — that is handled by a
-    /// separate, dedicated parse step (`decode_session_key`) so it never
+    /// separate, dedicated parse step (`decode_session_key_seed`) so it never
     /// ends up inside a `Debug`-derivable struct that could be accidentally
     /// logged.
     pub fn from_section(section: &HashMap<String, String>) -> Self {
@@ -219,12 +248,19 @@ impl SettlePolicyConfig {
             .get("max_cumulative_atomic_24h")
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(DEFAULT_MAX_CUMULATIVE_ATOMIC_24H);
+        let rpc_url = section.get("rpc_url").filter(|v| !v.is_empty()).cloned();
+        let session_token_account = section
+            .get("session_token_account")
+            .filter(|v| !v.is_empty())
+            .cloned();
         Self {
             expected_network,
             known_mint,
             max_amount_atomic,
             max_timeout_seconds,
             max_cumulative_atomic_24h,
+            rpc_url,
+            session_token_account,
         }
     }
 }
@@ -510,6 +546,30 @@ mod tests {
         assert_eq!(
             cfg.max_cumulative_atomic_24h,
             DEFAULT_MAX_CUMULATIVE_ATOMIC_24H
+        );
+        assert_eq!(cfg.rpc_url, None, "no safe default RPC endpoint exists");
+        assert_eq!(cfg.session_token_account, None);
+    }
+
+    #[test]
+    fn config_reads_rpc_url_and_session_token_account() {
+        let mut section = HashMap::new();
+        section.insert(
+            "rpc_url".to_string(),
+            "https://api.mainnet-beta.solana.com".to_string(),
+        );
+        section.insert(
+            "session_token_account".to_string(),
+            VALID_SOURCE_TOKEN_ACCOUNT.to_string(),
+        );
+        let cfg = SettlePolicyConfig::from_section(&section);
+        assert_eq!(
+            cfg.rpc_url.as_deref(),
+            Some("https://api.mainnet-beta.solana.com")
+        );
+        assert_eq!(
+            cfg.session_token_account.as_deref(),
+            Some(VALID_SOURCE_TOKEN_ACCOUNT)
         );
     }
 
