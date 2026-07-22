@@ -6,12 +6,13 @@
 //! transfer history, builds and signs an SPL Token Transfer, and retries the
 //! resource request with the `X-Payment` proof. See [`x402_settle`] for the
 //! tested policy/signing core, [`transaction`] for manual Solana transaction
-//! serialization, and [`rpc_history`] for turning RPC responses into spend
-//! records.
+//! serialization, [`rpc_history`] for turning RPC responses into spend
+//! records, and [`account_verify`] for the pre-signing destination check.
 //!
 //! Build:  rustup target add wasm32-wasip2
 //!         cargo build --target wasm32-wasip2 --release
 
+pub mod account_verify;
 pub mod rpc_history;
 pub mod transaction;
 pub mod x402_settle;
@@ -29,6 +30,7 @@ mod component {
 
     use zeroize::Zeroize;
 
+    use crate::account_verify::verify_token_account;
     use crate::rpc_history::extract_outgoing_transfer;
     use crate::transaction::{build_signed_transaction, to_base64};
     use crate::x402_settle::{
@@ -242,20 +244,24 @@ mod component {
 
             // Step 3: cumulative cap, recomputed from real on-chain history —
             // never an in-memory counter (see check_cumulative_cap docs).
-            let history = match fetch_recent_transfer_history(&rpc_url, &source_token_account) {
-                Ok(h) => h,
+            // Read the current slot once and reuse it both for "now" and as
+            // the minContextSlot floor for the history fetch immediately
+            // below, so a lagging RPC node fails closed instead of silently
+            // serving a stale (under-counted) history.
+            let current_slot = match rpc_get_slot(&rpc_url) {
+                Ok(s) => s,
                 Err(e) => {
                     emit(
                         PluginAction::Fail,
                         PluginOutcome::Failure,
-                        "history fetch failed",
+                        "slot fetch failed",
                     );
                     return Ok(deny(format!(
-                        "could not verify cumulative spend history, refusing to pay: {e}"
+                        "could not read current slot, refusing to pay: {e}"
                     )));
                 }
             };
-            let now_unix = match rpc_get_unix_time(&rpc_url) {
+            let now_unix = match rpc_get_block_time(&rpc_url, current_slot) {
                 Ok(t) => t,
                 Err(e) => {
                     emit(
@@ -265,6 +271,23 @@ mod component {
                     );
                     return Ok(deny(format!(
                         "could not determine current time, refusing to pay: {e}"
+                    )));
+                }
+            };
+            let history = match fetch_recent_transfer_history(
+                &rpc_url,
+                &source_token_account,
+                current_slot,
+            ) {
+                Ok(h) => h,
+                Err(e) => {
+                    emit(
+                        PluginAction::Fail,
+                        PluginOutcome::Failure,
+                        "history fetch failed",
+                    );
+                    return Ok(deny(format!(
+                        "could not verify cumulative spend history, refusing to pay: {e}"
                     )));
                 }
             };
@@ -319,6 +342,45 @@ mod component {
                     return Ok(deny(e));
                 }
             };
+
+            // Step 3.5: verify the destination is a real, correctly-owned
+            // token account for the accepted mint *before* ever signing.
+            // Closes a SOL-fee-griefing gap found during the second audit
+            // pass: a server-supplied payTo that passes the base58/length
+            // shape check but isn't actually an initialized SPL token
+            // account would still let us sign a transaction whose
+            // instruction is doomed to fail on-chain — and Solana can still
+            // charge the fee payer (this session key) the base SOL fee for
+            // a submitted-but-failing transaction, a cost the token-
+            // denominated spend caps don't track at all.
+            let account_info = match rpc_call(
+                &rpc_url,
+                "getAccountInfo",
+                serde_json::json!([req.pay_to, {"encoding": "jsonParsed"}]),
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    emit(
+                        PluginAction::Fail,
+                        PluginOutcome::Failure,
+                        "destination account lookup failed",
+                    );
+                    return Ok(deny(format!(
+                        "could not verify destination token account, refusing to sign: {e}"
+                    )));
+                }
+            };
+            if let Err(e) = verify_token_account(&account_info, &req.asset_mint) {
+                emit(
+                    PluginAction::Fail,
+                    PluginOutcome::Failure,
+                    "destination is not a valid token account for the accepted mint",
+                );
+                return Ok(deny(format!(
+                    "refusing to sign: destination failed verification: {e}"
+                )));
+            }
+
             // SPL_TOKEN_PROGRAM_ID is a fixed, compile-time-known constant, so
             // this can never fail in practice — but fail closed via the
             // normal deny() path rather than a panic, on principle: no
@@ -480,33 +542,53 @@ mod component {
         decode_pubkey(blockhash_str)
     }
 
-    /// Uses the cluster's own clock (via `getBlockTime` on the current slot,
-    /// obtained through `getSlot`) rather than any local wall-clock source —
-    /// the wasm sandbox exposes no clock import in this WIT world, and trusting
-    /// an unauthenticated local clock for a 24h spend-window boundary would be
-    /// a fail-open risk in itself.
-    fn rpc_get_unix_time(rpc_url: &str) -> Result<i64, String> {
-        let slot = rpc_call(
+    /// The cluster's current slot, read once per `execute()` call and reused
+    /// both as the source of "now" (via `getBlockTime`) and as the
+    /// `minContextSlot` floor for every subsequent read in the same call —
+    /// see `fetch_recent_transfer_history`'s doc comment for why.
+    fn rpc_get_slot(rpc_url: &str) -> Result<u64, String> {
+        rpc_call(
             rpc_url,
             "getSlot",
             serde_json::json!([{"commitment": "confirmed"}]),
         )?
-        .as_i64()
-        .ok_or("getSlot: response was not an integer")?;
-        let block_time = rpc_call(rpc_url, "getBlockTime", serde_json::json!([slot]))?
-            .as_i64()
-            .ok_or("getBlockTime: response was not an integer")?;
-        Ok(block_time)
+        .as_u64()
+        .ok_or_else(|| "getSlot: response was not an integer".to_string())
     }
 
+    /// Uses the cluster's own clock (`getBlockTime` on `slot`) rather than
+    /// any local wall-clock source — the wasm sandbox exposes no clock
+    /// import in this WIT world, and trusting an unauthenticated local clock
+    /// for a 24h spend-window boundary would be a fail-open risk in itself.
+    fn rpc_get_block_time(rpc_url: &str, slot: u64) -> Result<i64, String> {
+        rpc_call(rpc_url, "getBlockTime", serde_json::json!([slot]))?
+            .as_i64()
+            .ok_or_else(|| "getBlockTime: response was not an integer".to_string())
+    }
+
+    /// `min_context_slot` requires the RPC node to have caught up to at
+    /// least that slot before answering, or return an error — Solana's own
+    /// mechanism for refusing a stale read rather than silently serving one.
+    /// Fixes a real gap found during the second audit pass: without this,
+    /// an RPC node lagging behind (not necessarily malicious — could just be
+    /// a slow public endpoint) would silently return a short-but-genuine-
+    /// looking signature list, making `check_cumulative_cap` under-count
+    /// real recent spend with no error ever surfacing. Pinning both this
+    /// call and `getTransaction` below to the same slot `rpc_get_slot`
+    /// already read for "now" (see `execute`) closes that gap: a lagging
+    /// node fails closed here instead of silently serving stale data.
     fn fetch_recent_transfer_history(
         rpc_url: &str,
         tracked_token_account: &str,
+        min_context_slot: u64,
     ) -> Result<Vec<TransferRecord>, String> {
         let signatures_result = rpc_call(
             rpc_url,
             "getSignaturesForAddress",
-            serde_json::json!([tracked_token_account, {"limit": MAX_HISTORY_SIGNATURES}]),
+            serde_json::json!([
+                tracked_token_account,
+                {"limit": MAX_HISTORY_SIGNATURES, "minContextSlot": min_context_slot}
+            ]),
         )?;
         let signatures = signatures_result
             .as_array()
@@ -520,7 +602,11 @@ mod component {
             let tx = rpc_call(
                 rpc_url,
                 "getTransaction",
-                serde_json::json!([signature, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}]),
+                serde_json::json!([signature, {
+                    "encoding": "jsonParsed",
+                    "maxSupportedTransactionVersion": 0,
+                    "minContextSlot": min_context_slot
+                }]),
             )?;
             match extract_outgoing_transfer(&tx, tracked_token_account) {
                 Ok(Some(record)) => history.push(record),
