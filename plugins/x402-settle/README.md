@@ -209,6 +209,46 @@ enabled = true
 Run the agent with a build that includes a compiler backend, e.g.
 `--features plugins-wasm,plugins-wasm-cranelift`.
 
+## Validated against real Solana devnet, not just fixtures
+
+Every RPC shape this plugin depends on, and the transaction bytes it
+produces, were checked against `https://api.devnet.solana.com` directly
+(not simulated locally), using a real `solana-keygen`-generated keypair:
+
+- **Session key format** — generating a real keypair and feeding it through
+  `decode_session_key_seed` immediately surfaced a real compatibility bug,
+  fixed in code (see git history): the function only accepted a bare
+  32-byte seed, but `solana-keygen`/Phantom/Solflare all hand operators the
+  standard 64-byte `[seed||pubkey]` export. Both forms are accepted now,
+  with the 64-byte form's embedded pubkey cross-checked against its own
+  derived pubkey.
+- **`getAccountInfo`, `getTransaction`, `getSignaturesForAddress`,
+  `getLatestBlockhash`, `getBlockTime`** — all fetched live against a real,
+  actively-used devnet USDC-style mint (`4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU`)
+  and one of its real token accounts. The shapes matched what
+  `src/rpc_history.rs` and `src/account_verify.rs` already assumed; the
+  previously-modeled (not-yet-verified) fixtures were replaced with verbatim
+  captures — see the tests named `*_real_devnet*` in those two files.
+- **`minContextSlot` staleness guard** — confirmed live: requesting a slot
+  far in the future returns real RPC error `-32016` ("Minimum context slot
+  has not been reached"), and the actual current slot succeeds normally.
+- **The unfunded-account path** — `getAccountInfo` on a freshly generated,
+  never-funded pubkey returns `value: null` live, exactly matching
+  `AccountVerifyError::AccountDoesNotExist`'s assumption.
+- **The hand-rolled transaction wire format itself** — built and signed a
+  real transfer transaction with `build_signed_transaction` using the real
+  keypair and real devnet account addresses, then submitted it to
+  `simulateTransaction` (`sigVerify: false`) against live devnet. Result:
+  `"err": "AccountNotFound"` — the fee payer account genuinely has no SOL
+  (this environment's devnet faucet was rate-limited during testing, so a
+  fully-funded end-to-end submission wasn't completed) — **not** any kind
+  of transaction-deserialization or encoding error. The validator parsed
+  the message header, account ordering, and compiled instruction correctly
+  on the first try, which is the strongest evidence available short of a
+  fully funded transfer landing on-chain: the manual serialization in
+  `src/transaction.rs` is byte-compatible with a real Solana validator, not
+  just internally self-consistent.
+
 ## Second audit pass — findings from targeted skill-based review
 
 A follow-up audit specifically applied several security-focused review lenses
