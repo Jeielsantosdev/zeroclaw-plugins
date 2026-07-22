@@ -522,17 +522,46 @@ pub fn build_transfer_instruction(
 // Signing — ed25519 over the session key, never the operator's main wallet
 // ---------------------------------------------------------------------------
 
-/// Decode a base58-encoded 32-byte ed25519 seed. Kept as a dedicated function,
-/// distinct from `SettlePolicyConfig`, so the key material is never routed
-/// through a `Debug`-derivable struct that a stray `{:?}` log could leak.
+/// Base58 length ceiling for the session key input specifically — separate
+/// from `MAX_BASE58_PUBKEY_INPUT_LEN` (64 chars, sized for a bare 32-byte
+/// pubkey) because the standard Solana keypair export format below is
+/// 64 raw bytes, which base58-encodes to ~88 characters. Still tightly
+/// bounded (nowhere near where `bs58::decode`'s O(n²) cost becomes a real
+/// concern) — this is about accepting the real input shape, not loosening
+/// the DoS guard.
+const MAX_SESSION_KEY_INPUT_LEN: usize = 128;
+
+/// Decode a session key from its base58 form. Accepts **two** input shapes,
+/// found to both matter in practice while validating this against a real
+/// devnet keypair during testing:
+///
+/// - **32 raw bytes** — just the ed25519 seed.
+/// - **64 raw bytes** — the standard Solana keypair export format
+///   (`solana-keygen`'s JSON array, and what wallets like Phantom/Solflare
+///   give you from "export private key") is `[seed(32) || pubkey(32)]`. A
+///   64-byte input's trailing 32 bytes are cross-checked against the pubkey
+///   actually derived from its leading 32 bytes — a mismatch means a
+///   corrupted or mistyped key, not a different valid encoding, and is
+///   rejected rather than silently trusted.
+///
+/// Before this was verified against a real `solana-keygen`-generated
+/// keypair, this function only accepted the bare 32-byte form — which would
+/// have rejected the key material most real operators actually have on
+/// hand, copied straight from a wallet's "export private key" feature.
+///
+/// Kept as a dedicated function, distinct from `SettlePolicyConfig`, so the
+/// key material is never routed through a `Debug`-derivable struct that a
+/// stray `{:?}` log could leak.
 pub fn decode_session_key_seed(raw_base58: &str) -> Result<[u8; 32], String> {
     // Operator config, not attacker-controlled in the normal threat model —
-    // but the same O(n^2) bs58::decode cost applies to any input, so the
-    // same length guard applies here too, on general defense-in-depth
-    // principle (see MAX_BASE58_PUBKEY_INPUT_LEN's doc comment).
-    if raw_base58.len() > MAX_BASE58_PUBKEY_INPUT_LEN {
+    // but the same O(n^2) bs58::decode cost applies to any input, so a
+    // length guard still applies here, on general defense-in-depth
+    // principle (see MAX_BASE58_PUBKEY_INPUT_LEN's doc comment) — sized for
+    // the larger of the two accepted shapes, not the smaller.
+    if raw_base58.len() > MAX_SESSION_KEY_INPUT_LEN {
         return Err(format!(
-            "session key input is {} bytes, longer than any valid 32-byte seed could be",
+            "session key input is {} characters, longer than any valid encoding of a 32- or \
+             64-byte key could be",
             raw_base58.len()
         ));
     }
@@ -540,15 +569,39 @@ pub fn decode_session_key_seed(raw_base58: &str) -> Result<[u8; 32], String> {
         .into_vec()
         .map_err(|e| format!("session key is not valid base58: {e}"))?;
     // The decoded secret bytes live in this Vec's heap allocation regardless
-    // of whether decoding ultimately succeeds (wrong length) or not — scrub
-    // it on every exit from this point on, not just the happy path. Found
-    // during a zeroize audit: earlier code let this Vec drop normally.
-    if bytes.len() != 32 {
-        bytes.zeroize();
-        return Err("session key must decode to exactly 32 bytes".to_string());
-    }
-    let mut seed = [0u8; 32];
-    seed.copy_from_slice(&bytes);
+    // of which exit path below is taken — scrub it on every one, not just
+    // the happy path. Found during a zeroize audit: earlier code let this
+    // Vec drop normally.
+    let seed = match bytes.len() {
+        32 => {
+            let mut seed = [0u8; 32];
+            seed.copy_from_slice(&bytes);
+            seed
+        }
+        64 => {
+            let mut seed = [0u8; 32];
+            seed.copy_from_slice(&bytes[..32]);
+            let embedded_pubkey = &bytes[32..];
+            let derived_pubkey = session_key_pubkey(&seed);
+            if embedded_pubkey != derived_pubkey {
+                bytes.zeroize();
+                return Err(
+                    "session key is 64 bytes but the trailing 32 don't match the pubkey derived \
+                     from the leading 32 — this looks corrupted or mistyped, not a different \
+                     valid format"
+                        .to_string(),
+                );
+            }
+            seed
+        }
+        other => {
+            bytes.zeroize();
+            return Err(format!(
+                "session key must decode to 32 bytes (a bare seed) or 64 bytes (a standard \
+                 Solana keypair export), got {other}"
+            ));
+        }
+    };
     bytes.zeroize();
     Ok(seed)
 }
@@ -865,5 +918,59 @@ mod tests {
         let encoded = bs58::encode(seed).into_string();
         let decoded = decode_session_key_seed(&encoded).expect("valid seed must decode");
         assert_eq!(decoded, seed);
+    }
+
+    #[test]
+    fn decode_session_key_seed_accepts_the_standard_64_byte_keypair_export() {
+        // A real `solana-keygen new` keypair (generated and verified against
+        // this exact JSON array during manual devnet testing): bytes[0..32]
+        // is the seed, bytes[32..64] is the pubkey, matching what
+        // solana-keygen/Phantom/Solflare's "export private key" actually
+        // hand operators — not a bare 32-byte seed, which is what this
+        // function only accepted before this was tested against a real key.
+        let real_keypair_array: [u8; 64] = [
+            194, 171, 208, 63, 205, 250, 228, 49, 225, 160, 146, 187, 144, 182, 67, 179, 73, 64,
+            198, 59, 109, 106, 232, 47, 123, 44, 146, 254, 78, 23, 6, 199, 37, 47, 22, 131, 134,
+            155, 157, 245, 145, 67, 31, 12, 102, 57, 155, 55, 109, 83, 145, 198, 132, 90, 158, 14,
+            159, 64, 70, 190, 71, 10, 218, 141,
+        ];
+        let expected_pubkey_base58 = "3W9jKVLMsDuV8HXQkMMsC4m3LSdmGS96QKvGG8NMk11v";
+
+        let encoded = bs58::encode(real_keypair_array).into_string();
+        let seed = decode_session_key_seed(&encoded).expect("64-byte keypair export must decode");
+
+        let derived_pubkey_base58 = bs58::encode(session_key_pubkey(&seed)).into_string();
+        assert_eq!(
+            derived_pubkey_base58, expected_pubkey_base58,
+            "seed extracted from the 64-byte form must derive the same real devnet pubkey"
+        );
+    }
+
+    #[test]
+    fn decode_session_key_seed_rejects_64_bytes_with_mismatched_embedded_pubkey() {
+        let mut corrupted: [u8; 64] = [7u8; 64]; // seed = all 7s
+                                                 // Embed a pubkey that does NOT correspond to the all-7s seed.
+        let wrong_pubkey = session_key_pubkey(&[8u8; 32]);
+        corrupted[32..].copy_from_slice(&wrong_pubkey);
+
+        let encoded = bs58::encode(corrupted).into_string();
+        let err = decode_session_key_seed(&encoded).unwrap_err();
+        assert!(
+            err.contains("don't match"),
+            "a 64-byte key whose embedded pubkey doesn't match its own seed must be rejected \
+             as corrupted/mistyped, not silently accepted using just the seed half: {err}"
+        );
+    }
+
+    #[test]
+    fn decode_session_key_seed_rejects_lengths_other_than_32_or_64() {
+        for len in [16usize, 48, 100] {
+            let bytes = vec![3u8; len];
+            let encoded = bs58::encode(&bytes).into_string();
+            assert!(
+                decode_session_key_seed(&encoded).is_err(),
+                "length {len} is neither a bare seed (32) nor a standard keypair export (64)"
+            );
+        }
     }
 }

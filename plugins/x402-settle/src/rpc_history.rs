@@ -6,13 +6,16 @@
 //! shim — it makes no network calls itself, which is what keeps it
 //! host-testable with representative fixtures.
 //!
-//! **Fixture provenance note:** the JSON shapes below are modeled on the
+//! **Fixture provenance:** most fixtures below are modeled on the
 //! [documented Solana RPC HTTP API](https://solana.com/docs/rpc/http/gettransaction)
-//! response shape, not captured from a live transaction (this environment has
-//! no live RPC access). Before merge, re-verify field names and nesting
-//! against at least one real `getTransaction` response for a token transfer,
-//! the same way `plugins/x402-quote-check` verified its Kamino-adjacent
-//! assumptions against live data where possible.
+//! response shape. One (`extracts_from_a_real_devnet_transaction`) is a
+//! trimmed but otherwise verbatim capture of a real `getTransaction` response
+//! for signature
+//! `47jV74je72xtvHB7MwAXLkrqSDZBWPZouGDGyBq1xydRirMLD2oDnLZEgoDN2cvecnCxzD1gTqT9hjj69gpWuetq`
+//! (an SPL Token `transferChecked` for the devnet USDC-style mint
+//! `4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU`, fetched from
+//! `https://api.devnet.solana.com` — this environment does have live RPC
+//! access), confirming the modeled shapes above match reality.
 
 use crate::x402_settle::TransferRecord;
 
@@ -187,5 +190,58 @@ mod tests {
         });
         let record = extract_outgoing_transfer(&tx, TRACKED).expect("should parse");
         assert!(record.is_none());
+    }
+
+    #[test]
+    fn extracts_from_a_real_devnet_transaction() {
+        // Trimmed but verbatim `getTransaction` (jsonParsed) response fetched
+        // live from https://api.devnet.solana.com for signature
+        // 47jV74je72xtvHB7MwAXLkrqSDZBWPZouGDGyBq1xydRirMLD2oDnLZEgoDN2cvecnCxzD1gTqT9hjj69gpWuetq
+        // — an SPL "Withdraw from stream" program moving 1 atomic unit
+        // (0.000001) of the devnet USDC-style mint out of account index 3.
+        // Only fields this parser reads are kept; everything else (compute
+        // units, log messages, other balance entries, etc.) is omitted, but
+        // nothing present below was altered from the real response.
+        let real_tx = json!({
+            "blockTime": 1784757866,
+            "transaction": {
+                "message": {
+                    "accountKeys": [
+                        { "pubkey": "wdrwhnCv4pzW8beKsbPa4S2UDZrXenjg16KJdKSpb5u", "signer": true, "source": "transaction", "writable": true },
+                        { "pubkey": "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU", "signer": false, "source": "transaction", "writable": true },
+                        { "pubkey": "5SEpbdjFK5FxwTvfsGMXVQTD2v4M2c5tyRTxhdsPkgDw", "signer": false, "source": "transaction", "writable": true },
+                        { "pubkey": "5YGHhGV7L7gfL4aDBXrs3V6nLb7Kpkk9YFX8vg5rqGbN", "signer": false, "source": "transaction", "writable": true },
+                        { "pubkey": "7XCApjU1MR7eVgyturEaVnuDQYB9KU1KMSSytDPK1iRy", "signer": false, "source": "transaction", "writable": true }
+                    ]
+                }
+            },
+            "meta": {
+                "preTokenBalances": [
+                    {
+                        "accountIndex": 3,
+                        "mint": "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU",
+                        "owner": "5YGHhGV7L7gfL4aDBXrs3V6nLb7Kpkk9YFX8vg5rqGbN",
+                        "programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+                        "uiTokenAmount": { "amount": "30492", "decimals": 6, "uiAmount": 0.030492, "uiAmountString": "0.030492" }
+                    }
+                ],
+                "postTokenBalances": [
+                    {
+                        "accountIndex": 3,
+                        "mint": "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU",
+                        "owner": "5YGHhGV7L7gfL4aDBXrs3V6nLb7Kpkk9YFX8vg5rqGbN",
+                        "programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+                        "uiTokenAmount": { "amount": "30491", "decimals": 6, "uiAmount": 0.030491, "uiAmountString": "0.030491" }
+                    }
+                ]
+            }
+        });
+
+        let record =
+            extract_outgoing_transfer(&real_tx, "5YGHhGV7L7gfL4aDBXrs3V6nLb7Kpkk9YFX8vg5rqGbN")
+                .expect("must parse a real devnet response")
+                .expect("balance genuinely decreased in this real transaction");
+        assert_eq!(record.amount_atomic, 1);
+        assert_eq!(record.unix_timestamp, 1784757866);
     }
 }

@@ -11,9 +11,11 @@
 //!
 //! Like `rpc_history.rs`, this module only ever reasons about JSON already
 //! fetched by the wasm shim — no network calls here, which is what keeps it
-//! host-testable with representative fixtures. Same fixture-provenance
-//! caveat as `rpc_history.rs`: modeled on the documented RPC shape, not
-//! captured from a live call.
+//! host-testable with representative fixtures. Most fixtures are modeled on
+//! the documented RPC shape; `accepts_a_real_devnet_token_account` is a
+//! verbatim `getAccountInfo` response fetched live from
+//! `https://api.devnet.solana.com` for a real token account holding the
+//! devnet USDC-style mint, confirming the modeled shape matches reality.
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AccountVerifyError {
@@ -218,6 +220,90 @@ mod tests {
         assert_eq!(
             verify_token_account(&garbage, USDC_MINT).unwrap_err(),
             AccountVerifyError::MalformedResponse
+        );
+    }
+
+    #[test]
+    fn accepts_a_real_devnet_token_account() {
+        // Verbatim `getAccountInfo` (jsonParsed) response fetched live from
+        // https://api.devnet.solana.com for account
+        // 5YGHhGV7L7gfL4aDBXrs3V6nLb7Kpkk9YFX8vg5rqGbN, a real initialized
+        // SPL token account for the devnet USDC-style mint
+        // 4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU. Nothing altered
+        // except the balance amount, which changes every time someone
+        // interacts with this real, actively-used devnet account.
+        let real_response = json!({
+            "context": { "apiVersion": "4.2.0-beta.1", "slot": 478181164 },
+            "value": {
+                "data": {
+                    "parsed": {
+                        "info": {
+                            "isNative": false,
+                            "mint": "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU",
+                            "owner": "5YGHhGV7L7gfL4aDBXrs3V6nLb7Kpkk9YFX8vg5rqGbN",
+                            "state": "initialized",
+                            "tokenAmount": { "amount": "30490", "decimals": 6, "uiAmount": 0.03049, "uiAmountString": "0.03049" }
+                        },
+                        "type": "account"
+                    },
+                    "program": "spl-token",
+                    "space": 165
+                },
+                "executable": false,
+                "lamports": 2039280,
+                "owner": SPL_TOKEN_PROGRAM_ID,
+                "rentEpoch": 18446744073709551615u64,
+                "space": 165
+            }
+        });
+
+        verify_token_account(
+            &real_response,
+            "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU",
+        )
+        .expect("a real, genuine devnet token account must pass verification");
+    }
+
+    #[test]
+    fn rejects_a_real_devnet_mint_account_as_not_a_token_account() {
+        // Verbatim getAccountInfo response for the mint address itself
+        // (4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU) — a real, easy
+        // mistake for a hostile or careless server to make: pointing payTo
+        // at the mint instead of a token account for that mint. type is
+        // "mint", not "account", so no `info.mint` field exists to match
+        // against — must be rejected as NotAParsedTokenAccount.
+        let real_mint_response = json!({
+            "context": { "apiVersion": "4.2.0-beta.1", "slot": 478181023 },
+            "value": {
+                "data": {
+                    "parsed": {
+                        "info": {
+                            "decimals": 6,
+                            "freezeAuthority": "CJtyoKSLrktozQzjERTiK3btQtiTK3nN4QrqGHLidyCT",
+                            "isInitialized": true,
+                            "mintAuthority": "GrNg1XM2ctzeE2mXxXCfhcTUbejM8Z4z4wNVTy2FjMEz",
+                            "supply": "16286785255557674663"
+                        },
+                        "type": "mint"
+                    },
+                    "program": "spl-token",
+                    "space": 82
+                },
+                "executable": false,
+                "lamports": 397055532289u64,
+                "owner": SPL_TOKEN_PROGRAM_ID,
+                "rentEpoch": 18446744073709551615u64,
+                "space": 82
+            }
+        });
+
+        assert_eq!(
+            verify_token_account(
+                &real_mint_response,
+                "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU"
+            )
+            .unwrap_err(),
+            AccountVerifyError::NotAParsedTokenAccount
         );
     }
 }

@@ -54,7 +54,7 @@ delegated to the calling LLM:
 
 | Key | Default | Secret? | Meaning |
 |---|---|---|---|
-| `session_key` | *(required, no default)* | **Yes** | Base58-encoded 32-byte ed25519 seed. Must be a scoped session key funded only with what the operator is willing to lose — never the main wallet. Read only via `config_read`/`__config`; never logged (see "wasm32-wasip2 notes"). |
+| `session_key` | *(required, no default)* | **Yes** | Base58-encoded ed25519 key, in either of two forms: a bare 32-byte seed, or the standard 64-byte Solana keypair export (`[seed \|\| pubkey]`) that `solana-keygen`, Phantom, and Solflare all actually hand you — verified against a real `solana-keygen`-generated keypair during testing. A 64-byte input's embedded pubkey is cross-checked against the one derived from its own seed; a mismatch is rejected as corrupted/mistyped, not silently accepted. Must be a scoped session key funded only with what the operator is willing to lose — never the main wallet. Read only via `config_read`/`__config`; never logged (see "wasm32-wasip2 notes"). |
 | `rpc_url` | *(required, no default)* | No | Solana RPC endpoint. No hardcoded default — unlike the mint/network/caps below, there is no generically "safe" RPC endpoint to assume. |
 | `session_token_account` | *(required, no default)* | No | The session key's own SPL token account for the accepted mint — the `source` in every transfer this plugin builds. See "Known limitations". |
 | `expected_network` | `solana-mainnet` | No | Rejects any 402 whose network doesn't normalize to this. |
