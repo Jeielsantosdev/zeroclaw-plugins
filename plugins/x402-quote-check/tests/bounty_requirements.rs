@@ -1,11 +1,10 @@
 //! Automated checks tying this plugin directly to the bounty's hard
-//! requirements and judging criteria, instead of relying only on the manual
-//! checklist in `../../../VERIFICATION.md`. Each test names the exact
+//! requirements and judging criteria. Each test names the exact
 //! requirement/criterion it protects so a failure is self-explanatory.
 //!
-//! Judging criteria (official listing, see `../../../../docs/02-criterios-avaliacao.md`):
-//! utilidade real (30%), segurança/custódia (25%), qualidade de código (20%),
-//! prontidão para merge (15%), demo/documentação (10%).
+//! Judging criteria (official bounty listing): utilidade real (30%),
+//! segurança/custódia (25%), qualidade de código (20%), prontidão para
+//! merge (15%), demo/documentação (10%).
 
 use std::fs;
 use std::path::Path;
@@ -31,8 +30,8 @@ fn source_files() -> Vec<std::path::PathBuf> {
 }
 
 /// The portion of a source file before its `#[cfg(test)]` module, if any —
-/// production code only, matching the manual review procedure in
-/// `VERIFICATION.md` section 2.2.
+/// production code only. A malformed/hostile input or an internal error must
+/// produce `ToolResult { success: false, .. }`, never panic.
 fn production_code_only(source: &str) -> &str {
     match source.find("#[cfg(test)]") {
         Some(idx) => &source[..idx],
@@ -42,7 +41,7 @@ fn production_code_only(source: &str) -> &str {
 
 // ---------------------------------------------------------------------------
 // Hard requirement: "1 componente = 1 ferramenta"; manifest.toml correct
-// (docs/01-requisitos.md) — feeds prontidão para merge (15%)
+// — feeds prontidão para merge (15%)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -78,7 +77,7 @@ fn manifest_declares_a_custody_tier_relevant_description() {
 
 // ---------------------------------------------------------------------------
 // Hard requirement: only permissions actually used are declared
-// (docs/07-checklist.md) — feeds prontidão para merge (15%)
+// — feeds prontidão para merge (15%)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -116,7 +115,7 @@ fn declared_permissions_are_the_only_ones_and_are_all_actually_used() {
         assert!(
             lib_rs.contains("waki::"),
             "manifest declares http_client but src/lib.rs never uses waki:: — \
-             declaring an unused permission is a demerit per docs/02-criterios-avaliacao.md"
+             declaring an unused permission is a demerit per the judging criteria"
         );
     }
     if declares_config_read {
@@ -178,7 +177,7 @@ fn no_stdout_logging_anywhere_in_source() {
                 && !content.contains("eprintln!")
                 && !content.contains("dbg!"),
             "{path:?} must never log via stdout/stderr — only log_record is permitted \
-             (docs/07-checklist.md: \"nenhum println!/stdout no caminho do componente\")"
+             (hard requirement: no println!/stdout in the component path)"
         );
     }
 }
@@ -206,7 +205,7 @@ fn no_panicking_calls_in_production_code() {
 
 // ---------------------------------------------------------------------------
 // Hard requirement: no hardcoded secrets — instant-disqualification territory
-// (docs/01-requisitos.md, \"We will not accept\") — feeds segurança (25%)
+// (\"We will not accept\" — hardcoded secrets) — feeds segurança (25%)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -225,7 +224,7 @@ fn no_hardcoded_secret_looking_assignments() {
 
 // ---------------------------------------------------------------------------
 // Hard requirement: README covers what it does, config, tier, threat model,
-// example (docs/01-requisitos.md) — feeds demo/documentação (10%) as a
+// example — feeds demo/documentação (10%) as a
 // perception multiplier over the other 90%
 // ---------------------------------------------------------------------------
 

@@ -1,11 +1,10 @@
 //! Automated checks tying this plugin directly to the bounty's hard
-//! requirements and judging criteria, instead of relying only on the manual
-//! checklist in `../../../VERIFICATION.md`. Each test names the exact
+//! requirements and judging criteria. Each test names the exact
 //! requirement/criterion it protects so a failure is self-explanatory.
 //!
-//! Judging criteria (official listing, see `../../../../docs/02-criterios-avaliacao.md`):
-//! utilidade real (30%), segurança/custódia (25%), qualidade de código (20%),
-//! prontidão para merge (15%), demo/documentação (10%).
+//! Judging criteria (official bounty listing): utilidade real (30%),
+//! segurança/custódia (25%), qualidade de código (20%), prontidão para
+//! merge (15%), demo/documentação (10%).
 //!
 //! This crate is T2 — the bounty's own text warns the safety bar here is
 //! "brutal", so a few checks below exist only in this file, not in
@@ -37,8 +36,9 @@ fn source_files() -> Vec<std::path::PathBuf> {
 }
 
 /// The portion of a source file before its `#[cfg(test)]` module, if any —
-/// production code only, matching the manual review procedure in
-/// `VERIFICATION.md` section 2.2.
+/// production code only. A malformed/hostile input, an RPC error, or an
+/// internal error must produce `ToolResult { success: false, .. }` or `Err`,
+/// never panic.
 fn production_code_only(source: &str) -> &str {
     match source.find("#[cfg(test)]") {
         Some(idx) => &source[..idx],
