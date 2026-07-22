@@ -888,6 +888,26 @@ mod tests {
     }
 
     #[test]
+    fn sign_message_matches_rfc8032_test_vector_2() {
+        // RFC 8032 §7.1, TEST 2 (Ed25519): a real, non-empty message this
+        // time (single byte 0x72) — pinning correctness on more than just
+        // the degenerate empty-message case TEST 1 covers.
+        let seed_bytes =
+            hex_decode("4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb");
+        let expected_pubkey =
+            hex_decode("3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c");
+        let expected_sig = hex_decode(
+            "92a009a9f0d4cab8720e820b5f642540a2b27b5416503f8fb3762223ebdb69da085ac1e43e15996e458f3613d0f11d8c387b2eaeb4302aeeb00d291612bb0c00",
+        );
+
+        let mut seed = [0u8; 32];
+        seed.copy_from_slice(&seed_bytes);
+
+        assert_eq!(session_key_pubkey(&seed).to_vec(), expected_pubkey);
+        assert_eq!(sign_message(&seed, &[0x72]).to_vec(), expected_sig);
+    }
+
+    #[test]
     fn sign_message_is_deterministic() {
         let seed = [42u8; 32];
         let a = sign_message(&seed, b"pay 1000000 atomic units");
