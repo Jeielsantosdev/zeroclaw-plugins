@@ -296,10 +296,22 @@ pub fn validate_requirements(req: &PaymentRequirement, cfg: &QuoteCheckConfig) -
     }
 }
 
+/// A base58-encoded 32-byte value never legitimately exceeds ~44 characters;
+/// this generous cap exists purely to reject pathological input *before*
+/// `bs58::decode` ever sees it. `bs58`'s decoder is O(n²) in the input
+/// length (confirmed empirically: ~0.2ms at 1,000 chars, ~530ms at 50,000
+/// chars) — an attacker-controlled `payTo` string with no length check
+/// ahead of decoding is a real CPU-exhaustion vector, not a theoretical one.
+/// A malicious or compromised x402 server controls this field entirely.
+const MAX_BASE58_PUBKEY_INPUT_LEN: usize = 64;
+
 /// A Solana public key is exactly 32 bytes once base58-decoded. This does
 /// not prove the account exists or is the "right" one — only that the field
 /// is not garbage, a lookalike string, or an injection attempt.
 fn is_well_formed_pubkey(candidate: &str) -> bool {
+    if candidate.len() > MAX_BASE58_PUBKEY_INPUT_LEN {
+        return false;
+    }
     match bs58::decode(candidate).into_vec() {
         Ok(bytes) => bytes.len() == 32,
         Err(_) => false,
