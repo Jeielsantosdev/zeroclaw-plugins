@@ -31,7 +31,7 @@ mod component {
     use zeroize::Zeroize;
 
     use crate::account_verify::verify_token_account;
-    use crate::rpc_history::extract_outgoing_transfer;
+    use crate::rpc_history::{extract_outgoing_transfer, select_signatures_within_window};
     use crate::transaction::{build_signed_transaction, to_base64};
     use crate::x402_settle::{
         check_cumulative_cap, decode_session_key_seed, parse_requirements, session_key_pubkey,
@@ -50,12 +50,33 @@ mod component {
     const PLUGIN_VERSION: &str = env!("CARGO_PKG_VERSION");
     const TOOL_NAME: &str = "x402_settle";
     const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-    /// Cap on any single HTTP/RPC response body this component will read.
+    /// Cap on the initial and final HTTP fetch of the x402 resource itself.
     const MAX_BODY_BYTES: usize = 32 * 1024;
-    /// How many recent signatures to inspect for the cumulative cap. Bounded
-    /// so a very active session account can never turn one `execute()` call
-    /// into an unbounded number of RPC round trips.
-    const MAX_HISTORY_SIGNATURES: usize = 50;
+    /// Cap on any single RPC response body. Larger than `MAX_BODY_BYTES`
+    /// deliberately: `getSignaturesForAddress` at `SIGNATURES_FETCH_LIMIT`
+    /// runs ~233 bytes/entry in practice (measured against real devnet
+    /// data), so 200 entries is ~47 KiB — the original shared 32 KiB cap
+    /// would have rejected that response outright, silently defeating the
+    /// point of raising the signature limit below.
+    const MAX_RPC_BODY_BYTES: usize = 96 * 1024;
+    /// How many signatures `getSignaturesForAddress` fetches per call.
+    /// Solana's hard ceiling for this method is 1000; 200 is chosen instead
+    /// because responses at that size stay comfortably under
+    /// `MAX_RPC_BODY_BYTES` (~47 KiB observed vs. a 96 KiB cap) while still
+    /// covering a genuinely active session key's realistic daily volume.
+    /// This bounds the size of *one* RPC call, not how many of those
+    /// signatures actually get inspected — see `MAX_HISTORY_TRANSACTIONS_TO_FETCH`
+    /// and `fetch_recent_transfer_history`'s doc comment for the real fix to
+    /// the under-counting risk this constant alone doesn't solve.
+    const SIGNATURES_FETCH_LIMIT: usize = 200;
+    /// Hard cap on how many `getTransaction` calls one `execute()` will make
+    /// to reconstruct 24h of spend history. If more than this many
+    /// signatures fall inside the 24h window, this plugin refuses to pay
+    /// rather than silently inspect only a subset of them — under-counting
+    /// real spend here is exactly the fail-open risk `check_cumulative_cap`
+    /// exists to prevent, so an inability to fully verify spend must itself
+    /// deny, not degrade to "probably fine."
+    const MAX_HISTORY_TRANSACTIONS_TO_FETCH: usize = 100;
 
     #[derive(serde::Deserialize)]
     struct ExecuteArgs {
@@ -278,6 +299,7 @@ mod component {
                 &rpc_url,
                 &source_token_account,
                 current_slot,
+                now_unix,
             ) {
                 Ok(h) => h,
                 Err(e) => {
@@ -509,9 +531,9 @@ mod component {
         let raw = resp
             .body()
             .map_err(|e| format!("RPC {method}: failed to read response body: {e}"))?;
-        if raw.len() > MAX_BODY_BYTES {
+        if raw.len() > MAX_RPC_BODY_BYTES {
             return Err(format!(
-                "RPC {method}: response exceeds {MAX_BODY_BYTES} bytes"
+                "RPC {method}: response exceeds {MAX_RPC_BODY_BYTES} bytes"
             ));
         }
         if !(200..300).contains(&status) {
@@ -577,28 +599,46 @@ mod component {
     /// call and `getTransaction` below to the same slot `rpc_get_slot`
     /// already read for "now" (see `execute`) closes that gap: a lagging
     /// node fails closed here instead of silently serving stale data.
+    ///
+    /// **Filters by `blockTime` before ever calling `getTransaction`.**
+    /// `getSignaturesForAddress` returns newest-first and already includes
+    /// each signature's `blockTime` — no need to fetch the full transaction
+    /// just to find out it's outside the 24h window. This closes a real
+    /// under-counting risk found while load-testing the original design
+    /// against real response sizes: fetching only the `limit` *most recent*
+    /// signatures (previously 50, with no time filtering) would silently
+    /// miss older-but-still-in-window transfers on any session key active
+    /// enough to have more than `limit` transactions in a day — exactly the
+    /// kind of account this plugin exists to serve. If more than
+    /// `MAX_HISTORY_TRANSACTIONS_TO_FETCH` signatures fall inside the
+    /// window, this returns an error (denying the payment) rather than
+    /// silently inspecting only some of them.
     fn fetch_recent_transfer_history(
         rpc_url: &str,
         tracked_token_account: &str,
         min_context_slot: u64,
+        now_unix: i64,
     ) -> Result<Vec<TransferRecord>, String> {
         let signatures_result = rpc_call(
             rpc_url,
             "getSignaturesForAddress",
             serde_json::json!([
                 tracked_token_account,
-                {"limit": MAX_HISTORY_SIGNATURES, "minContextSlot": min_context_slot}
+                {"limit": SIGNATURES_FETCH_LIMIT, "minContextSlot": min_context_slot}
             ]),
         )?;
         let signatures = signatures_result
             .as_array()
             .ok_or("getSignaturesForAddress: response was not an array")?;
 
+        let in_window_signatures = select_signatures_within_window(
+            signatures,
+            now_unix,
+            MAX_HISTORY_TRANSACTIONS_TO_FETCH,
+        )?;
+
         let mut history = Vec::new();
-        for entry in signatures {
-            let Some(signature) = entry.get("signature").and_then(|s| s.as_str()) else {
-                continue;
-            };
+        for signature in in_window_signatures {
             let tx = rpc_call(
                 rpc_url,
                 "getTransaction",

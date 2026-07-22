@@ -17,7 +17,54 @@
 //! `https://api.devnet.solana.com` — this environment does have live RPC
 //! access), confirming the modeled shapes above match reality.
 
-use crate::x402_settle::TransferRecord;
+use crate::x402_settle::{TransferRecord, CUMULATIVE_WINDOW_SECONDS};
+
+/// From a `getSignaturesForAddress` response (newest-first), select the
+/// signatures that fall within the trailing 24h window ending at
+/// `now_unix`, without needing to fetch each one's full transaction first —
+/// `getSignaturesForAddress` already reports each entry's `blockTime`.
+///
+/// Pulled out of the wasm shim into this host-testable pure function on
+/// purpose: the filtering logic here is exactly the kind of thing this
+/// project's pure-core/thin-shim split exists to protect from going
+/// untested, and it very nearly didn't get a single test of its own when
+/// it was written straight into `lib.rs`.
+///
+/// Returns `Err` if more than `max_count` signatures fall inside the
+/// window — under-counting real spend by silently checking only some of
+/// them would defeat the entire purpose of the cumulative cap this feeds,
+/// so an inability to fully verify spend must itself deny the payment, not
+/// degrade to "probably fine."
+pub fn select_signatures_within_window(
+    signatures: &[serde_json::Value],
+    now_unix: i64,
+    max_count: usize,
+) -> Result<Vec<&str>, String> {
+    let window_start = now_unix.saturating_sub(CUMULATIVE_WINDOW_SECONDS);
+    let mut selected = Vec::new();
+    for entry in signatures {
+        let Some(signature) = entry.get("signature").and_then(|s| s.as_str()) else {
+            continue;
+        };
+        match entry.get("blockTime").and_then(|b| b.as_i64()) {
+            // Newest-first ordering: once one entry is older than the
+            // window, every remaining entry is too — stop scanning.
+            Some(block_time) if block_time <= window_start => break,
+            // A missing blockTime is not proof the entry is old — be
+            // conservative and still inspect it rather than assume it's
+            // out of window.
+            _ => selected.push(signature),
+        }
+    }
+    if selected.len() > max_count {
+        return Err(format!(
+            "at least {} signatures fall within the trailing 24h window, exceeding the {max_count} \
+             this plugin will inspect per call",
+            selected.len()
+        ));
+    }
+    Ok(selected)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HistoryParseError {
@@ -243,5 +290,76 @@ mod tests {
                 .expect("balance genuinely decreased in this real transaction");
         assert_eq!(record.amount_atomic, 1);
         assert_eq!(record.unix_timestamp, 1784757866);
+    }
+
+    fn sig(signature: &str, block_time: i64) -> serde_json::Value {
+        json!({ "signature": signature, "blockTime": block_time, "slot": 1, "err": null, "confirmationStatus": "finalized" })
+    }
+
+    #[test]
+    fn select_signatures_within_window_uses_real_devnet_signature_list_shape() {
+        // Verbatim getSignaturesForAddress entries fetched live from
+        // https://api.devnet.solana.com for the same mint used above.
+        let real_signatures = vec![
+            json!({"blockTime":1784757889,"confirmationStatus":"finalized","err":null,"memo":"[36] 2107ed4b-6ebb-4373-923d-1753581ac1f1","signature":"26M9eMgEraNgHRFn4U4duxSvZGhA3AB96eENWwPmfnksBNMizUTYLi7mf86cMciHjL5JousptTuVxJ59f8SgpX8M","slot":478181027,"transactionIndex":23}),
+            json!({"blockTime":1784757887,"confirmationStatus":"finalized","err":null,"memo":null,"signature":"4FLmgEnm7mjMabWotsXvFaQndvR1BDtdMBoREzrKQKK9UMpn3Vu9f4PcCg865NQrqXn8bUBCJss9Ks5o9MYhju2M","slot":478181022,"transactionIndex":2}),
+            json!({"blockTime":1784757885,"confirmationStatus":"finalized","err":null,"memo":"[36] 41e28be0-0c8f-49b3-b820-eb33451cb122","signature":"3bdARJhijmfVYLtsFHydb6QL7oG1PYqtE8jhAPeGpZAvkTwMNrPU1bSofnqy6KU1BkNgsa5DN5GrjKFuuCpQUJXA","slot":478181015,"transactionIndex":22}),
+            json!({"blockTime":1784757870,"confirmationStatus":"finalized","err":null,"memo":null,"signature":"4MWZUkMvsZ6Uqd32GTBtrP8moWZ79dttNNLSYm8Ftj5UWEcfYNkiiueyay4xQNxtyPiuSQAEfax7WUVPZQdH1kbC","slot":478180976,"transactionIndex":2}),
+            json!({"blockTime":1784757866,"confirmationStatus":"finalized","err":null,"memo":"[10] Auto-Claim","signature":"47jV74je72xtvHB7MwAXLkrqSDZBWPZouGDGyBq1xydRirMLD2oDnLZEgoDN2cvecnCxzD1gTqT9hjj69gpWuetq","slot":478180965,"transactionIndex":4}),
+        ];
+        // "Now" set just after the newest entry — all 5 fall well within a
+        // 24h window that starts long before any of them.
+        let now = 1784757890;
+        let selected = select_signatures_within_window(&real_signatures, now, 100).unwrap();
+        assert_eq!(selected.len(), 5);
+        assert_eq!(
+            selected[0],
+            "26M9eMgEraNgHRFn4U4duxSvZGhA3AB96eENWwPmfnksBNMizUTYLi7mf86cMciHjL5JousptTuVxJ59f8SgpX8M"
+        );
+    }
+
+    #[test]
+    fn select_signatures_within_window_stops_at_the_first_stale_entry() {
+        let now = 100_000i64;
+        let window_start = now - CUMULATIVE_WINDOW_SECONDS;
+        let signatures = vec![
+            sig("newest", now - 10),
+            sig("also_recent", now - 20),
+            sig("exactly_at_boundary", window_start), // <= window_start: stale
+            sig("would_have_been_in_window_but_never_scanned", now - 1), // must never be reached
+        ];
+        let selected = select_signatures_within_window(&signatures, now, 100).unwrap();
+        assert_eq!(selected, vec!["newest", "also_recent"]);
+    }
+
+    #[test]
+    fn select_signatures_within_window_treats_missing_block_time_as_in_window() {
+        let signatures = vec![json!({ "signature": "no_block_time_field" })];
+        let selected = select_signatures_within_window(&signatures, 1_000_000, 100).unwrap();
+        assert_eq!(
+            selected,
+            vec!["no_block_time_field"],
+            "a missing blockTime must not be silently treated as 'safely old'"
+        );
+    }
+
+    #[test]
+    fn select_signatures_within_window_denies_when_over_the_inspection_cap() {
+        let now = 1_000_000i64;
+        let signatures: Vec<serde_json::Value> =
+            (0..5).map(|i| sig(&format!("sig{i}"), now - i)).collect();
+        let err = select_signatures_within_window(&signatures, now, 3).unwrap_err();
+        assert!(
+            err.contains('5'),
+            "error should mention the actual in-window count: {err}"
+        );
+    }
+
+    #[test]
+    fn select_signatures_within_window_allows_exactly_at_the_cap() {
+        let now = 1_000_000i64;
+        let signatures: Vec<serde_json::Value> =
+            (0..3).map(|i| sig(&format!("sig{i}"), now - i)).collect();
+        assert!(select_signatures_within_window(&signatures, now, 3).is_ok());
     }
 }
