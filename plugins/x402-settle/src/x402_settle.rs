@@ -319,7 +319,21 @@ pub fn validate_requirements(req: &PaymentRequirement, cfg: &SettlePolicyConfig)
     }
 }
 
+/// A base58-encoded 32-byte value never legitimately exceeds ~44 characters;
+/// this generous cap rejects pathological input *before* `bs58::decode` ever
+/// sees it. `bs58`'s decoder is O(n²) in input length (confirmed
+/// empirically against the sibling `x402-quote-check` plugin: ~0.2ms at
+/// 1,000 chars, ~530ms at 50,000 chars — a ~1MB input hangs for minutes).
+/// Every pubkey-shaped field this crate decodes can originate from an
+/// untrusted server (`payTo` in the 402 response) or, in `lib.rs`, from
+/// data threaded through from that response — this is a real CPU-exhaustion
+/// guard, not defense-in-depth theater.
+pub(crate) const MAX_BASE58_PUBKEY_INPUT_LEN: usize = 64;
+
 fn is_well_formed_pubkey(candidate: &str) -> bool {
+    if candidate.len() > MAX_BASE58_PUBKEY_INPUT_LEN {
+        return false;
+    }
     match bs58::decode(candidate).into_vec() {
         Ok(bytes) => bytes.len() == 32,
         Err(_) => false,
@@ -428,6 +442,21 @@ impl std::fmt::Display for BuildInstructionError {
 }
 
 fn decode_pubkey(field: &'static str, candidate: &str) -> Result<[u8; 32], BuildInstructionError> {
+    // See MAX_BASE58_PUBKEY_INPUT_LEN's doc comment: bs58::decode is O(n^2)
+    // in input length, and `destination_token_account` here is ultimately
+    // sourced from an untrusted server's payTo field. Reject oversized input
+    // before decoding, and never embed the full (potentially huge) input
+    // into the error value either.
+    if candidate.len() > MAX_BASE58_PUBKEY_INPUT_LEN {
+        return Err(BuildInstructionError::InvalidPubkey {
+            field,
+            value: format!(
+                "<{}-byte input, truncated: {:.64}...>",
+                candidate.len(),
+                candidate
+            ),
+        });
+    }
     let bytes =
         bs58::decode(candidate)
             .into_vec()
@@ -495,6 +524,16 @@ pub fn build_transfer_instruction(
 /// distinct from `SettlePolicyConfig`, so the key material is never routed
 /// through a `Debug`-derivable struct that a stray `{:?}` log could leak.
 pub fn decode_session_key_seed(raw_base58: &str) -> Result<[u8; 32], String> {
+    // Operator config, not attacker-controlled in the normal threat model —
+    // but the same O(n^2) bs58::decode cost applies to any input, so the
+    // same length guard applies here too, on general defense-in-depth
+    // principle (see MAX_BASE58_PUBKEY_INPUT_LEN's doc comment).
+    if raw_base58.len() > MAX_BASE58_PUBKEY_INPUT_LEN {
+        return Err(format!(
+            "session key input is {} bytes, longer than any valid 32-byte seed could be",
+            raw_base58.len()
+        ));
+    }
     let bytes = bs58::decode(raw_base58)
         .into_vec()
         .map_err(|e| format!("session key is not valid base58: {e}"))?;

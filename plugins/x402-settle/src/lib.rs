@@ -522,6 +522,18 @@ mod component {
     }
 
     fn decode_pubkey(candidate: &str) -> Result<[u8; 32], String> {
+        // bs58::decode is O(n^2) in input length (see MAX_BASE58_PUBKEY_INPUT_LEN
+        // in x402_settle.rs); `candidate` here can ultimately trace back to
+        // an untrusted server's `payTo` field. Reject oversized input before
+        // ever decoding, and never format the full candidate into an error
+        // either — both the CPU cost and the error-message size scale with
+        // attacker-controlled input length otherwise.
+        if candidate.len() > crate::x402_settle::MAX_BASE58_PUBKEY_INPUT_LEN {
+            return Err(format!(
+                "input is {} bytes, longer than any valid 32-byte pubkey could be",
+                candidate.len()
+            ));
+        }
         let bytes = bs58::decode(candidate)
             .into_vec()
             .map_err(|e| format!("{candidate:?} is not valid base58: {e}"))?;
