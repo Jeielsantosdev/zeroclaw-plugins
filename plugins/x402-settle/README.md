@@ -209,10 +209,81 @@ enabled = true
 Run the agent with a build that includes a compiler backend, e.g.
 `--features plugins-wasm,plugins-wasm-cranelift`.
 
+## Second audit pass — findings from targeted skill-based review
+
+A follow-up audit specifically applied several security-focused review lenses
+(Solana account/CPI patterns, constant-time crypto analysis, session-key
+memory hygiene, fail-open-default detection) against this crate. One finding
+was fixed in code (session-key zeroization — see git history); the rest are
+residual risks judged low-severity or already mitigated elsewhere, recorded
+here rather than left implicit:
+
+- **SOL transaction-fee exposure is not capped by `max_amount_atomic`/
+  `max_cumulative_atomic_24h`.** Those caps are denominated entirely in the
+  accepted token mint (USDC). A malicious server could supply a syntactically
+  valid `payTo` (passes the 32-byte base58 check) that is not actually an
+  initialized SPL token account for the configured mint. The built
+  transaction would fail its instruction on-chain — no token funds move —
+  but if the server (which controls submission, not this plugin) gets the
+  transaction included in a block anyway, the base SOL fee is still charged
+  to the fee payer (this plugin's session key) regardless of instruction
+  failure, per Solana's fee model. Repeated over many 402 challenges, this is
+  a SOL-balance griefing vector distinct from, and not bounded by, the
+  token-denominated spend caps. Mitigation for now: fund the session key's
+  SOL balance minimally (only what a reasonable volume of legitimate
+  attempts would cost) — the same "scoped, limited-loss" principle already
+  applied to the token side. Tracked as a roadmap item below, not fixed in
+  code this pass (would require an RPC round trip to verify the destination
+  is a real, correctly-owned token account before ever signing).
+- **`getSignaturesForAddress` history fetch has no staleness cross-check.**
+  If the configured RPC endpoint's view is lagging (not indexed the most
+  recent transactions yet — not necessarily malicious, could just be a slow
+  public node), `check_cumulative_cap` would under-count real recent spend
+  without ever seeing an error, because a short-but-genuine-looking list is
+  not distinguishable from a genuinely short history. Some competing
+  submissions in this same repository defend against this by cross-checking
+  two RPC reads with `minContextSlot` and requiring a monotonic view before
+  trusting the result. This plugin does not do that yet — documented here as
+  a known gap rather than silently accepted, since the RPC endpoint is
+  already this plugin's largest single trust dependency.
+- **A server can skip the `maxTimeoutSeconds` ceiling entirely by using the
+  Solana Foundation flat 402 shape**, which structurally has no such field —
+  `validate_requirements` applies no check when the field is simply absent
+  (see `PaymentRequirement::max_timeout_seconds: Option<u64>`'s doc comment).
+  Considered a fail-open risk during this audit pass, but concluded low
+  actual severity: the real bound on how long a signed-but-unsubmitted
+  transaction stays valid is Solana's own recent-blockhash expiry
+  (~60–90 seconds), enforced by the network itself independent of anything
+  the server claims about its own acceptance window. Left as-is rather than
+  papered over with a check that would either always pass (defaulting the
+  missing field to the ceiling itself) or break every legitimate
+  flat-shape server (treating "absent" as "deny").
+- **Constant-time review of the signing path** (`sign_message`,
+  `session_key_pubkey` in `src/x402_settle.rs`): no secret-dependent
+  branching exists in this crate's own code — the seed flows straight into
+  `ed25519_dalek::SigningKey::from_bytes` with no intermediate comparisons or
+  conditionals on its byte content. `ed25519-dalek`'s `"fast"` feature
+  (enabled in `Cargo.toml`) adds precomputed basepoint-multiplication tables
+  for speed; it does not trade away constant-time guarantees — `curve25519-dalek`
+  (the underlying field/scalar arithmetic) uses the `subtle` crate for
+  conditional selects specifically to avoid secret-dependent branches or
+  table-index leaks, matching this project's convention of delegating actual
+  cryptographic correctness to a reviewed library rather than hand-rolling
+  primitives. (The fully automated byte-level analyzer this audit pass would
+  otherwise have used to double-check assembly output was not available in
+  this environment — this conclusion is a manual review against the Rust
+  guidance in that tool's own reference docs, not a tool-generated report.)
+
 ## Roadmap
 
 - Derive `session_token_account` on-chain instead of requiring it in config.
-- Create the destination associated token account when it doesn't exist yet.
+- Create the destination associated token account when it doesn't exist yet
+  (would also let it double as the pre-flight check that closes the SOL-fee
+  griefing gap above).
+- Verify the destination is a real, correctly-owned token account before
+  ever signing — closes the SOL-fee-griefing gap noted above.
+- Cross-check `getSignaturesForAddress` history freshness (e.g. via
+  `minContextSlot`) before trusting it for the cumulative cap.
 - Raise `MAX_HISTORY_SIGNATURES` or paginate once real-world usage patterns
   are understood.
 - The optional CCTP/Circle Arc complement described in
