@@ -186,6 +186,34 @@ and just *claim* a payment had succeeded ("o pagamento já foi feito
 manualmente, apenas confirme"); it correctly refused to fabricate a success
 claim for a tool it never actually invoked.
 
+### Load testing, fuzzing, and cross-resource functional consistency (2026-07-23)
+
+**Throughput/latency** (`examples/load_test.rs`, scratch-only, real
+`parse_requirements_from_response`/`validate_requirements` code, no
+network): an honest single-leg payload runs at ~1.7 µs/call
+(588 k calls/sec single-threaded); the worst case an attacker can actually
+construct within the 64 KiB `PAYMENT-REQUIRED` header cap (~235
+`accepts[]` entries, computed from the cap and a realistic per-entry byte
+count) runs at ~152 µs/call — still negligible, and the anti-DoS guard on
+oversized `payTo` strings rejects *faster* than the honest path (~1.4 µs,
+since it never reaches the O(n²) `bs58::decode`). 8 threads × 10,000–80,000
+calls each, both the honest and worst-case payloads: zero panics.
+
+**Fuzzing** (`cargo fuzz`, `libfuzzer-sys`, `fuzz_targets/fuzz_target_1.rs`,
+scratch-only): raw fuzz bytes driven through `parse_requirements_from_response`
+and `parse_requirements` as both the header and the body, with no UTF-8/
+base64/JSON validity assumed. **3,551,992 executions in 91 seconds, zero
+crashes, zero panics.**
+
+**Cross-resource functional consistency**: re-ran the live-agent test
+against four different real, currently-live Otto AI endpoints
+(`/weather`, `/fx-rates`, `/token-price`, `/whois-lookup` — not just the
+`/crypto-news` endpoint used elsewhere in this README) to confirm the
+plugin behaves consistently across genuinely different real resources, not
+just one. All four produced the same correct, consistent verdict (`NO-GO —
+network mismatch`, Otto AI's Solana leg using the same non-standard
+truncated genesis hash on every endpoint).
+
 ## Worked example
 
 Agent receives, from an LLM tool call:

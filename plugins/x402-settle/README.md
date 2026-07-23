@@ -213,6 +213,23 @@ tokens, the destination from 0 → 1. This is direct proof the plugin's
 signing/serialization logic produces transactions the real Solana network
 actually accepts — not just internally self-consistent bytes.
 
+### Load testing and fuzzing (2026-07-23)
+
+**Throughput/latency** (`examples/load_test.rs`, scratch-only, real code):
+an honest single-leg payload runs at ~1.5 µs/call; `check_cumulative_cap`
+at the real 50-entry history bound (`MAX_HISTORY_SIGNATURES` in `lib.rs`)
+runs at ~25 ns/call — pure bounded arithmetic, no measurable cost. 8
+threads × 10,000 calls: zero panics.
+
+**Fuzzing** (`cargo fuzz`, `fuzz_targets/parse_probe.rs`, scratch-only):
+two targets in one harness — raw bytes through
+`parse_requirements_from_response`/`parse_requirements` (header and body,
+no validity assumed), and raw bytes reinterpreted as up to 64
+`(amount_atomic: u64, unix_timestamp: i64)` history entries driven straight
+into `check_cumulative_cap`, covering values like `u64::MAX` and negative/
+overflowing timestamps that a compromised RPC endpoint could in principle
+return. **3,348,522 executions in 91 seconds, zero crashes, zero panics.**
+
 ## Worked example
 
 Given a legitimate x402 challenge for 0.50 USDC on `solana-mainnet`, under
