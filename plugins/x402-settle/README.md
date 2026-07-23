@@ -370,19 +370,19 @@ produces, were checked against `https://api.devnet.solana.com` directly
 - **The unfunded-account path** — `getAccountInfo` on a freshly generated,
   never-funded pubkey returns `value: null` live, exactly matching
   `AccountVerifyError::AccountDoesNotExist`'s assumption.
-- **The hand-rolled transaction wire format itself** — built and signed a
-  real transfer transaction with `build_signed_transaction` using the real
-  keypair and real devnet account addresses, then submitted it to
-  `simulateTransaction` (`sigVerify: false`) against live devnet. Result:
-  `"err": "AccountNotFound"` — the fee payer account genuinely has no SOL
-  (this environment's devnet faucet was rate-limited during testing, so a
-  fully-funded end-to-end submission wasn't completed) — **not** any kind
-  of transaction-deserialization or encoding error. The validator parsed
-  the message header, account ordering, and compiled instruction correctly
-  on the first try, which is the strongest evidence available short of a
-  fully funded transfer landing on-chain: the manual serialization in
-  `src/transaction.rs` is byte-compatible with a real Solana validator, not
-  just internally self-consistent.
+- **The hand-rolled transaction wire format itself** — first checked with
+  `simulateTransaction` (`sigVerify: false`) against live devnet using an
+  unfunded fee payer, which returned `"err": "AccountNotFound"` (the fee
+  payer genuinely had no SOL yet at that point) rather than any kind of
+  transaction-deserialization or encoding error — meaning the validator
+  already parsed the message header, account ordering, and compiled
+  instruction correctly. That gap (a fully-funded, actually-submitted
+  transfer) was closed later the same day once the account was funded —
+  see "Layer 4" above: `build_signed_transaction`'s real output was
+  submitted via `sendTransaction` and confirmed `finalized` on-chain, with
+  real token balances moving. Between the two, this covers both "does the
+  validator accept the wire format" and "does a real transfer actually
+  land."
 
 ## Second audit pass — findings from targeted skill-based review
 
