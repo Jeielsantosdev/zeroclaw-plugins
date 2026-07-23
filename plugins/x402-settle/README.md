@@ -197,6 +197,18 @@ If the cumulative 24h cap would be exceeded instead:
   Do not change `transaction.rs`'s signing model without first inspecting a
   real 402 response's `extra` block from a live server; see `x402.md` in the
   planning repo for the open question.
+- **Known risk: vendored `wit/v0/logging.wit` drift (found 2026-07-23).**
+  Testing against a from-source build of the actual `zeroclaw-labs/zeroclaw`
+  host (v0.8.3) showed the `wit/v0/logging.wit` checked into this repo is
+  missing a `memory-audit` variant on `plugin-action` that the current host
+  already has, which fails component registration entirely
+  (`discovered: 1, registered: 0`, linker error on
+  `zeroclaw:plugin/logging@0.1.0`). Confirmed in an isolated scratch copy
+  that this plugin registers and runs correctly once the vendored WIT is
+  back in sync — not a bug in this plugin's code, a shared-file vendoring
+  drift that affects every plugin in `zeroclaw-plugins`. Not fixed here
+  since `wit/v0/` is shared repo-wide infrastructure, not this plugin's own
+  code.
 
 ## Layout (the reference format)
 

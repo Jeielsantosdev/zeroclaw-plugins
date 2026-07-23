@@ -185,6 +185,21 @@ enabled = true
 Run the agent with a build that includes a compiler backend, e.g.
 `--features plugins-wasm,plugins-wasm-cranelift`.
 
+**Known risk, found by testing against a from-source host build
+(2026-07-23):** at the time of this testing, the `wit/v0/logging.wit`
+checked into this repo (`zeroclaw-plugins`) was missing a `memory-audit`
+variant on the `plugin-action` enum that the current `zeroclaw-labs/zeroclaw`
+host already has. A component built against the checked-in WIT failed to
+register against a freshly-built host with `component imports instance
+zeroclaw:plugin/logging@0.1.0, but a matching implementation was not found
+in the linker` (`discovered: 1, registered: 0`). Verified in an isolated
+scratch copy that the plugin registers and runs correctly once the vendored
+WIT is back in sync — this is not a bug in this plugin's code, it is a
+vendoring-drift issue in the shared `wit/v0/` this repo ships, and it would
+affect every plugin in `zeroclaw-plugins`, not only this one. Flagging here
+rather than fixing `wit/v0` directly, since that file is shared across the
+whole plugin catalog.
+
 ## Roadmap
 
 `x402-settle` (T2) — signs and submits the actual payment using a scoped
@@ -192,4 +207,5 @@ session key, with a cumulative 24h spend cap recomputed from real on-chain
 history on every call (the `tool-plugin` world is stateless by construction:
 a fresh store per `execute`, so an in-memory counter would be meaningless).
 It calls into this crate's `validate_requirements` as an internal
-precondition before ever building a transaction. Not yet built.
+precondition before ever building a transaction. Built — see
+`plugins/x402-settle/`.
