@@ -1,10 +1,12 @@
 //! A ZeroClaw WIT tool plugin: `x402_quote_check`.
 //!
-//! Fetches an x402-gated resource, parses the HTTP 402 payment-requirements
-//! body (tolerating the two schema shapes observed in the wild — see
-//! `x402::parse_requirements`), and returns a GO/NO-GO verdict against
-//! operator-configured policy (network, mint, per-call amount cap, `payTo`
-//! shape, timeout ceiling). **This plugin never pays anything** — it holds no
+//! Fetches an x402-gated resource, parses the HTTP 402 payment requirements
+//! (preferring the base64-encoded `PAYMENT-REQUIRED` response header real
+//! servers use, falling back to the response body's own shape tolerance —
+//! see `x402::parse_requirements_from_response`), and returns a GO/NO-GO
+//! verdict against operator-configured policy (network, mint, per-call
+//! amount cap, `payTo` shape, timeout ceiling). **This plugin never pays
+//! anything** — it holds no
 //! session key, builds no transaction, and cannot itself be the target of a
 //! "drain the funds" attack. It is the T0 half of a two-part delivery: see
 //! the README's "Roadmap" section for the planned `x402-settle` (T2) sibling.
@@ -29,7 +31,9 @@ mod component {
     use std::collections::HashMap;
     use std::time::Duration;
 
-    use crate::x402::{format_brief, parse_requirements, validate_requirements, QuoteCheckConfig};
+    use crate::x402::{
+        format_brief, parse_requirements_from_response, validate_requirements, QuoteCheckConfig,
+    };
     use exports::zeroclaw::plugin::plugin_info::Guest as PluginInfo;
     use exports::zeroclaw::plugin::tool::{Guest as Tool, ToolResult};
     use zeroclaw::plugin::logging::{
@@ -153,6 +157,17 @@ mod component {
                 });
             }
 
+            // Real x402 servers (confirmed against live Otto AI and Syra
+            // deployments, 2026-07-23) carry the payment requirements in a
+            // base64-encoded `PAYMENT-REQUIRED` response header, not the
+            // body — the body is typically just a human-readable hint.
+            // `header()` borrows, so it must run before `body()` consumes
+            // `resp`.
+            let payment_required_header = resp
+                .header("payment-required")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
+
             let body = match resp.body() {
                 Ok(b) if b.len() > MAX_BODY_BYTES => {
                     emit(
@@ -189,7 +204,10 @@ mod component {
                 }
             };
 
-            let req = match parse_requirements(&body_text) {
+            let req = match parse_requirements_from_response(
+                payment_required_header.as_deref(),
+                &body_text,
+            ) {
                 Ok(r) => r,
                 Err(e) => {
                     emit(

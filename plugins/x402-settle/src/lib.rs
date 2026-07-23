@@ -34,9 +34,9 @@ mod component {
     use crate::rpc_history::{extract_outgoing_transfer, select_signatures_within_window};
     use crate::transaction::{build_signed_transaction, to_base64};
     use crate::x402_settle::{
-        check_cumulative_cap, decode_session_key_seed, parse_requirements, session_key_pubkey,
-        validate_requirements, CapVerdict, SettlePolicyConfig, TransferRecord, Verdict,
-        SPL_TOKEN_PROGRAM_ID,
+        check_cumulative_cap, decode_session_key_seed, parse_requirements_from_response,
+        session_key_pubkey, validate_requirements, CapVerdict, SettlePolicyConfig, TransferRecord,
+        Verdict, SPL_TOKEN_PROGRAM_ID,
     };
     use exports::zeroclaw::plugin::plugin_info::Guest as PluginInfo;
     use exports::zeroclaw::plugin::tool::{Guest as Tool, ToolResult};
@@ -227,18 +227,18 @@ mod component {
                     error: None,
                 });
             }
-            let body_text = match String::from_utf8(first_resp.body) {
-                Ok(s) => s,
-                Err(_) => {
-                    emit(
-                        PluginAction::Fail,
-                        PluginOutcome::Failure,
-                        "402 body not utf8",
-                    );
-                    return Ok(deny("402 response body is not valid UTF-8".to_string()));
-                }
-            };
-            let req = match parse_requirements(&body_text) {
+            // Real x402 servers put the payload in the base64
+            // `PAYMENT-REQUIRED` header, not the body (confirmed against
+            // live Otto AI and Syra deployments, 2026-07-23) — the body is
+            // only a fallback here, so a non-UTF-8 body must not block a
+            // valid header from being read. Lossy conversion is fine: an
+            // invalid-UTF-8 body would fail JSON parsing anyway, and the
+            // header path is tried first regardless.
+            let body_text = String::from_utf8_lossy(&first_resp.body).into_owned();
+            let req = match parse_requirements_from_response(
+                first_resp.payment_required_header.as_deref(),
+                &body_text,
+            ) {
                 Ok(r) => r,
                 Err(e) => {
                     emit(
@@ -477,6 +477,11 @@ mod component {
     struct HttpResponse {
         status: u16,
         body: Vec<u8>,
+        /// The base64-encoded `PAYMENT-REQUIRED` response header, if present
+        /// — real x402 servers (confirmed against live Otto AI and Syra
+        /// deployments, 2026-07-23) carry payment requirements here, not in
+        /// the body. See `x402_settle::parse_requirements_from_response`.
+        payment_required_header: Option<String>,
     }
 
     /// `payment_header`, when present, is sent as `X-Payment`. Kept as a
@@ -498,6 +503,11 @@ mod component {
             .send()
             .map_err(|e| format!("request to {url} failed: {e}"))?;
         let status = resp.status_code();
+        // `header()` borrows, so it must run before `body()` consumes `resp`.
+        let payment_required_header = resp
+            .header("payment-required")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
         let body = resp
             .body()
             .map_err(|e| format!("failed to read response body from {url}: {e}"))?;
@@ -506,7 +516,11 @@ mod component {
                 "response body from {url} exceeds {MAX_BODY_BYTES} bytes — refusing to parse"
             ));
         }
-        Ok(HttpResponse { status, body })
+        Ok(HttpResponse {
+            status,
+            body,
+            payment_required_header,
+        })
     }
 
     fn rpc_call(

@@ -143,6 +143,61 @@ pub fn parse_requirements(raw_json: &str) -> Result<PaymentRequirement, ParseErr
     })
 }
 
+/// Header value length cap, applied before base64 decoding — bounds decode
+/// cost against a hostile or misbehaving server, same rationale as
+/// `MAX_BODY_BYTES` in the wasm shim.
+const MAX_PAYMENT_REQUIRED_HEADER_LEN: usize = 64 * 1024;
+
+/// Parse an x402 402 response using the real-world shape confirmed against
+/// live Solana x402 servers (Otto AI, Syra, 2026-07-23): the payment
+/// requirements travel in a base64-encoded `PAYMENT-REQUIRED` response
+/// *header*, spec v2's `accepts[]` JSON — not in the response body at all
+/// (the body is typically just a human-readable hint). The header is tried
+/// first; if it is absent, oversized, not valid base64/UTF-8/JSON, or lacks
+/// `accepts[]`, this falls back to `parse_requirements` on the body.
+pub fn parse_requirements_from_response(
+    payment_required_header: Option<&str>,
+    body: &str,
+) -> Result<PaymentRequirement, ParseError> {
+    if let Some(req) = payment_required_header.and_then(try_parse_payment_required_header) {
+        return Ok(req);
+    }
+    parse_requirements(body)
+}
+
+/// Best-effort decode-and-parse of the `PAYMENT-REQUIRED` header. `None`
+/// covers every way a real or hostile server's header could fail to be
+/// usable (oversized, not base64, not UTF-8, not the v2 `accepts[]` shape) —
+/// the caller treats all of them identically: fall back to the body.
+fn try_parse_payment_required_header(header: &str) -> Option<PaymentRequirement> {
+    if header.len() > MAX_PAYMENT_REQUIRED_HEADER_LEN {
+        return None;
+    }
+    let decoded = decode_base64_permissive(header)?;
+    let json = String::from_utf8(decoded).ok()?;
+    parse_v2_accepts_shape(&json).ok()
+}
+
+/// Real servers have been observed emitting both padded and unpadded
+/// standard base64 for the `PAYMENT-REQUIRED` header; try both rather than
+/// assuming one.
+fn decode_base64_permissive(raw: &str) -> Option<Vec<u8>> {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD
+        .decode(raw)
+        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(raw))
+        .ok()
+}
+
+/// Loose, non-authoritative check used only to pick which `accepts[]` entry
+/// to evaluate out of a multi-chain list — never used for policy decisions.
+/// Matches CAIP-2 `solana:...` and the flat aliases documented in the
+/// Solana Foundation tutorial and x402 spec examples.
+fn looks_like_solana_network(raw: &str) -> bool {
+    let lower = raw.trim().to_ascii_lowercase();
+    lower.starts_with("solana") || matches!(lower.as_str(), "mainnet-beta" | "mainnet" | "devnet")
+}
+
 fn parse_v2_accepts_shape(raw_json: &str) -> Result<PaymentRequirement, String> {
     #[derive(serde::Deserialize)]
     struct Accept {
@@ -160,19 +215,36 @@ fn parse_v2_accepts_shape(raw_json: &str) -> Result<PaymentRequirement, String> 
     }
 
     let parsed: V2Response = serde_json::from_str(raw_json).map_err(|e| e.to_string())?;
-    let first = parsed
+    if parsed.accepts.is_empty() {
+        return Err("accepts[] is empty".to_string());
+    }
+    // `accepts[]` is multi-chain in the wild (confirmed against a real Otto
+    // AI response, 2026-07-23). This crate only ever settles Solana
+    // payments, so it must pick the first *Solana*-looking entry, not
+    // blindly `accepts[0]` — otherwise a multi-chain server's Solana leg
+    // goes unevaluated. This selection is intentionally loose (see
+    // `looks_like_solana_network`); the strict, exact `SolanaCluster`
+    // comparison still runs in `validate_requirements` against policy
+    // afterwards, so a mis-selected or malformed entry cannot produce a
+    // false GO or an unsafe transaction build.
+    let chosen_index = parsed
+        .accepts
+        .iter()
+        .position(|a| looks_like_solana_network(&a.network))
+        .unwrap_or(0);
+    let chosen = parsed
         .accepts
         .into_iter()
-        .next()
-        .ok_or_else(|| "accepts[] is empty".to_string())?;
-    let amount_atomic = first.amount.into_u64()?;
+        .nth(chosen_index)
+        .ok_or_else(|| "internal: chosen accepts[] index out of bounds".to_string())?;
+    let amount_atomic = chosen.amount.into_u64()?;
 
     Ok(PaymentRequirement {
-        network: SolanaCluster::parse(&first.network),
-        asset_mint: first.asset,
+        network: SolanaCluster::parse(&chosen.network),
+        asset_mint: chosen.asset,
         amount_atomic,
-        pay_to: first.pay_to,
-        max_timeout_seconds: first.max_timeout_seconds,
+        pay_to: chosen.pay_to,
+        max_timeout_seconds: chosen.max_timeout_seconds,
         source_shape: "x402-spec-v2-accepts",
     })
 }
