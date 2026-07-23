@@ -75,9 +75,18 @@ impl QuoteCheckConfig {
     }
 }
 
-/// Normalized Solana cluster identifier. Different response shapes spell
-/// this differently ("solana-mainnet" vs "mainnet-beta"); comparisons must
-/// happen on this normalized form, never on the raw string.
+/// CAIP-2 genesis hashes for the two clusters this plugin recognizes.
+/// Confirmed against live x402 Solana servers (Otto AI, Syra — both emit
+/// `network: "solana:<genesis-hash>"` in their `accepts[]` entries, not the
+/// flat "solana-mainnet" string). See the README for the source.
+pub const MAINNET_GENESIS_HASH: &str = "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d";
+pub const DEVNET_GENESIS_HASH: &str = "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG";
+
+/// Normalized Solana cluster identifier. Response shapes spell this three
+/// different ways in the wild: the flat tutorial shape's "mainnet-beta", the
+/// spec v2 example's "solana-mainnet", and — confirmed against real live
+/// servers — the CAIP-2 form "solana:<genesis-hash>". Comparisons must happen
+/// on this normalized form, never on the raw string.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SolanaCluster {
     Mainnet,
@@ -87,11 +96,22 @@ pub enum SolanaCluster {
 
 impl SolanaCluster {
     pub fn parse(raw: &str) -> Self {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "solana-mainnet" | "mainnet-beta" | "mainnet" => SolanaCluster::Mainnet,
-            "solana-devnet" | "devnet" => SolanaCluster::Devnet,
-            other => SolanaCluster::Other(other.to_string()),
+        let trimmed = raw.trim();
+        let lower = trimmed.to_ascii_lowercase();
+        match lower.as_str() {
+            "solana-mainnet" | "mainnet-beta" | "mainnet" => return SolanaCluster::Mainnet,
+            "solana-devnet" | "devnet" => return SolanaCluster::Devnet,
+            _ => {}
         }
+        if let Some(genesis_hash) = trimmed.strip_prefix("solana:") {
+            if genesis_hash == MAINNET_GENESIS_HASH {
+                return SolanaCluster::Mainnet;
+            }
+            if genesis_hash == DEVNET_GENESIS_HASH {
+                return SolanaCluster::Devnet;
+            }
+        }
+        SolanaCluster::Other(lower)
     }
 }
 
@@ -376,6 +396,41 @@ mod tests {
         assert_eq!(req.amount_atomic, 1_000_000);
         assert_eq!(req.network, SolanaCluster::Mainnet);
         assert_eq!(req.max_timeout_seconds, Some(60));
+    }
+
+    #[test]
+    fn parses_v2_accepts_shape_with_caip2_network() {
+        let body = serde_json::json!({
+            "x402Version": 2,
+            "accepts": [{
+                "scheme": "exact",
+                "network": format!("solana:{MAINNET_GENESIS_HASH}"),
+                "amount": "1000000",
+                "asset": DEFAULT_MAINNET_USDC_MINT,
+                "payTo": VALID_PAYTO,
+                "maxTimeoutSeconds": 60
+            }]
+        })
+        .to_string();
+
+        let req = parse_requirements(&body).expect("should parse v2 shape with CAIP-2 network");
+        assert_eq!(req.network, SolanaCluster::Mainnet);
+    }
+
+    #[test]
+    fn solana_cluster_parse_recognizes_caip2_devnet() {
+        assert_eq!(
+            SolanaCluster::parse(&format!("solana:{DEVNET_GENESIS_HASH}")),
+            SolanaCluster::Devnet
+        );
+    }
+
+    #[test]
+    fn solana_cluster_parse_unknown_caip2_hash_is_other_not_silently_mainnet() {
+        match SolanaCluster::parse("solana:not-a-real-genesis-hash") {
+            SolanaCluster::Other(_) => {}
+            other => panic!("expected Other for unrecognized genesis hash, got {other:?}"),
+        }
     }
 
     #[test]

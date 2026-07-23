@@ -40,6 +40,13 @@ pub(crate) const SPL_TOKEN_TRANSFER_TAG: u8 = 3;
 // Requirement parsing and policy validation (duplicated from x402-quote-check)
 // ---------------------------------------------------------------------------
 
+/// CAIP-2 genesis hashes for the two clusters this plugin recognizes.
+/// Confirmed against live x402 Solana servers (Otto AI, Syra — both emit
+/// `network: "solana:<genesis-hash>"` in their `accepts[]` entries, not the
+/// flat "solana-mainnet" string). See the README for the source.
+pub const MAINNET_GENESIS_HASH: &str = "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d";
+pub const DEVNET_GENESIS_HASH: &str = "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SolanaCluster {
     Mainnet,
@@ -49,16 +56,31 @@ pub enum SolanaCluster {
 
 impl SolanaCluster {
     pub fn parse(raw: &str) -> Self {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "solana-mainnet" | "mainnet-beta" | "mainnet" => SolanaCluster::Mainnet,
-            "solana-devnet" | "devnet" => SolanaCluster::Devnet,
-            other => SolanaCluster::Other(other.to_string()),
+        let trimmed = raw.trim();
+        let lower = trimmed.to_ascii_lowercase();
+        match lower.as_str() {
+            "solana-mainnet" | "mainnet-beta" | "mainnet" => return SolanaCluster::Mainnet,
+            "solana-devnet" | "devnet" => return SolanaCluster::Devnet,
+            _ => {}
         }
+        if let Some(genesis_hash) = trimmed.strip_prefix("solana:") {
+            if genesis_hash == MAINNET_GENESIS_HASH {
+                return SolanaCluster::Mainnet;
+            }
+            if genesis_hash == DEVNET_GENESIS_HASH {
+                return SolanaCluster::Devnet;
+            }
+        }
+        SolanaCluster::Other(lower)
     }
 
-    /// The canonical x402 spec v2 network label for this cluster, used when
-    /// building the outgoing `X-Payment` payload. Always the spec's own
-    /// naming convention, regardless of which shape the *inbound* 402 used.
+    /// The x402 spec v2 network label for this cluster, used when building
+    /// the outgoing `X-Payment` payload. Currently emits the flat
+    /// "solana-mainnet" form; live servers (Otto AI, Syra) send CAIP-2
+    /// (`solana:<genesis-hash>`) inbound, and it is not yet confirmed
+    /// whether they also expect CAIP-2 on the reply leg. Do not change this
+    /// without checking a real 402 response's `extra` field first — see
+    /// x402.md.
     pub fn network_label(&self) -> &str {
         match self {
             SolanaCluster::Mainnet => "solana-mainnet",
@@ -638,6 +660,30 @@ mod tests {
     const VALID_OWNER: &str = "6ZzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWzz";
 
     // ---- requirement parsing / validation (parity with x402-quote-check) ----
+
+    #[test]
+    fn solana_cluster_parse_recognizes_caip2_mainnet() {
+        assert_eq!(
+            SolanaCluster::parse(&format!("solana:{MAINNET_GENESIS_HASH}")),
+            SolanaCluster::Mainnet
+        );
+    }
+
+    #[test]
+    fn solana_cluster_parse_recognizes_caip2_devnet() {
+        assert_eq!(
+            SolanaCluster::parse(&format!("solana:{DEVNET_GENESIS_HASH}")),
+            SolanaCluster::Devnet
+        );
+    }
+
+    #[test]
+    fn solana_cluster_parse_unknown_caip2_hash_is_other_not_silently_mainnet() {
+        match SolanaCluster::parse("solana:not-a-real-genesis-hash") {
+            SolanaCluster::Other(_) => {}
+            other => panic!("expected Other for unrecognized genesis hash, got {other:?}"),
+        }
+    }
 
     #[test]
     fn empty_config_uses_safe_defaults() {

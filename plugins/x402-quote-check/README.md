@@ -42,15 +42,20 @@ shapes for the same HTTP 402 response:
 - The [Solana Foundation's own x402 tutorial](https://solana.com/developers/guides/getstarted/intro-to-x402):
   a flatter `{ payment: { recipientWallet, mint, amount, amountUSDC, cluster, message } }`.
 
-Nothing indicates which one a given real-world server will actually emit —
-this looks like an artifact of a genuinely young, not-yet-fully-converged
-ecosystem, not a documentation error on either side. `parse_requirements`
+**Update, confirmed against live servers (2026-07-23):** the flat Solana
+Foundation shape is a tutorial-only artifact, not what production servers
+emit. Two live x402-on-Solana servers (Otto AI, Syra) both use spec v2
+`accepts[]` exclusively, with `network` as a **CAIP-2 identifier**
+(`solana:<genesis-hash>`, e.g. `solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d`
+for mainnet) rather than the flat string `solana-mainnet`. `parse_requirements`
 tries the spec-v2 shape first, then the Solana Foundation flat shape,
 rejecting only if the body matches neither (`src/x402.rs`). This is schema
 *tolerance*, not leniency: every field that survives parsing, from either
 shape, still goes through the exact same `validate_requirements` policy
 check below — accepting an unfamiliar envelope never means trusting its
-contents.
+contents. `SolanaCluster::parse` normalizes all three spellings
+(`solana-mainnet`/`mainnet-beta`/`mainnet`, and CAIP-2
+`solana:<genesis-hash>`) to the same internal value before any comparison.
 
 ## Config keys
 
@@ -60,7 +65,7 @@ have safe, conservative defaults — the same defaults an unprivileged install
 
 | Key | Default | Meaning |
 |---|---|---|
-| `expected_network` | `solana-mainnet` | Rejects any 402 whose `network`/`cluster` doesn't normalize to this. Accepts both naming conventions (`solana-mainnet`/`mainnet-beta`/`mainnet`, `solana-devnet`/`devnet`). |
+| `expected_network` | `solana-mainnet` | Rejects any 402 whose `network`/`cluster` doesn't normalize to this. Accepts the flat spellings (`solana-mainnet`/`mainnet-beta`/`mainnet`, `solana-devnet`/`devnet`) and the CAIP-2 form (`solana:<genesis-hash>`) real servers send. |
 | `known_mint` | the canonical mainnet USDC mint (`EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v`) | Exact byte-for-byte match required. A mint that merely *looks* like USDC is rejected, never accepted "close enough". |
 | `max_amount_atomic` | `5000000` (5.00 USDC at 6 decimals) | Per-call cap. A 402 asking for more is a NO-GO regardless of any other field. |
 | `max_timeout_seconds` | `300` | Ceiling on the server-requested payment window (`maxTimeoutSeconds`). Absent from a response entirely (the Solana Foundation shape has no such field) is not itself a rejection — it is simply not checked. |

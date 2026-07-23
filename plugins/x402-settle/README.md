@@ -57,7 +57,7 @@ delegated to the calling LLM:
 | `session_key` | *(required, no default)* | **Yes** | Base58-encoded ed25519 key, in either of two forms: a bare 32-byte seed, or the standard 64-byte Solana keypair export (`[seed \|\| pubkey]`) that `solana-keygen`, Phantom, and Solflare all actually hand you — verified against a real `solana-keygen`-generated keypair during testing. A 64-byte input's embedded pubkey is cross-checked against the one derived from its own seed; a mismatch is rejected as corrupted/mistyped, not silently accepted. Must be a scoped session key funded only with what the operator is willing to lose — never the main wallet. Read only via `config_read`/`__config`; never logged (see "wasm32-wasip2 notes"). |
 | `rpc_url` | *(required, no default)* | No | Solana RPC endpoint. No hardcoded default — unlike the mint/network/caps below, there is no generically "safe" RPC endpoint to assume. |
 | `session_token_account` | *(required, no default)* | No | The session key's own SPL token account for the accepted mint — the `source` in every transfer this plugin builds. See "Known limitations". |
-| `expected_network` | `solana-mainnet` | No | Rejects any 402 whose network doesn't normalize to this. |
+| `expected_network` | `solana-mainnet` | No | Rejects any 402 whose network doesn't normalize to this. Accepts the flat spellings (`solana-mainnet`/`mainnet-beta`/`mainnet`, `solana-devnet`/`devnet`) and the CAIP-2 form (`solana:<genesis-hash>`) live servers actually send — see `SolanaCluster::parse` in `src/x402_settle.rs`. |
 | `known_mint` | canonical mainnet USDC mint | No | Exact byte-for-byte match required — a lookalike mint is rejected, never accepted "close enough". |
 | `max_amount_atomic` | `5000000` (5.00 USDC) | No | Per-call cap. |
 | `max_cumulative_atomic_24h` | `20000000` (20.00 USDC) | No | Rolling 24h cap, recomputed from on-chain history every call. |
@@ -187,6 +187,16 @@ If the cumulative 24h cap would be exceeded instead:
   at submission (a clear, attributable failure — not a silent loss of
   funds), rather than this plugin silently creating an account on the
   operator's behalf.
+- **Fee-payer model not yet cross-checked against a real v2 server (flagged
+  2026-07-23).** `transaction.rs` always makes the session key both the
+  transfer authority *and* the fee payer — the flow demonstrated in the
+  Solana Foundation's own tutorial, which that tutorial itself labels "not
+  audited and not production ready." Live servers (Otto AI, Syra) instead
+  carry an `extra.feePayer` field in `accepts[]`, naming a facilitator —
+  suggesting real settlement may not be "client signs and pays its own gas."
+  Do not change `transaction.rs`'s signing model without first inspecting a
+  real 402 response's `extra` block from a live server; see `x402.md` in the
+  planning repo for the open question.
 
 ## Layout (the reference format)
 
