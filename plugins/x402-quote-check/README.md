@@ -155,16 +155,15 @@ like a legitimate field. Noted as a hardening idea, not fixed here (would
 mean truncating/escaping field values before formatting — a code-quality
 tradeoff, not a security bug, since fund-safety never depends on it).
 
-To regenerate: copy this crate + `wit/v0/` into a scratch directory (see
-"Known risk" note above for the exact reason a scratch copy is needed
-instead of building in place), drop in an `examples/injection_probe.rs`
-that calls `parse_requirements_from_response` and `validate_requirements`
+To regenerate: drop an `examples/injection_probe.rs` into this crate that
+calls `parse_requirements_from_response` and `validate_requirements`
 directly with the four payloads above, and `cargo run --example
-injection_probe`.
+injection_probe` (originally run from a scratch copy before the
+"Resolved risk" fix above landed; not needed anymore).
 
 ### Live-agent transcript (2026-07-23) — real Gemini-backed ZeroClaw agent
 
-Ran against a real, from-source `zeroclaw` host (see the "Known risk" note
+Ran against a real, from-source `zeroclaw` host (see the "Resolved risk" note
 above) with a real Gemini model, given the message: *"Use a ferramenta de
 x402 para conferir se vale a pena pagar pelo recurso em
 http://127.0.0.1:8900/resource?scenario=network_field. Diga GO ou NO-GO e
@@ -275,20 +274,26 @@ enabled = true
 Run the agent with a build that includes a compiler backend, e.g.
 `--features plugins-wasm,plugins-wasm-cranelift`.
 
-**Known risk, found by testing against a from-source host build
-(2026-07-23):** at the time of this testing, the `wit/v0/logging.wit`
-checked into this repo (`zeroclaw-plugins`) was missing a `memory-audit`
-variant on the `plugin-action` enum that the current `zeroclaw-labs/zeroclaw`
-host already has. A component built against the checked-in WIT failed to
-register against a freshly-built host with `component imports instance
+**Resolved risk, found and fixed 2026-07-23:** testing against a
+from-source host build initially surfaced a vendoring drift —
+`wit/v0/logging.wit` was missing a `memory-audit` variant on the
+`plugin-action` enum that `zeroclaw-labs/zeroclaw`'s own copy already had
+(landed there at `zeroclaw@208091c`, "restore WIT logging action parity",
+#9258), so a component built against the checked-in WIT failed to register
+against a current host (`component imports instance
 zeroclaw:plugin/logging@0.1.0, but a matching implementation was not found
-in the linker` (`discovered: 1, registered: 0`). Verified in an isolated
-scratch copy that the plugin registers and runs correctly once the vendored
-WIT is back in sync — this is not a bug in this plugin's code, it is a
-vendoring-drift issue in the shared `wit/v0/` this repo ships, and it would
-affect every plugin in `zeroclaw-plugins`, not only this one. Flagging here
-rather than fixing `wit/v0` directly, since that file is shared across the
-whole plugin catalog.
+in the linker`, `discovered: 1, registered: 0`) — confirmed to affect every
+plugin in `zeroclaw-plugins`, not only this one. Reported upstream on
+Discord and independently confirmed by another contributor who'd hit the
+same thing; a maintainer pointed at the exact source commit. Fixed by
+re-syncing `wit/v0/logging.wit` verbatim from `zeroclaw@208091c` (branch
+`fix/wit-v0-logging-parity`, merged into this branch) — every plugin in the
+repo that references `PluginAction` (`redact-text`, `email`, `mqtt`,
+`twitch`, plus both x402 plugins) was rebuilt and retested clean against
+the fix before merging, since it's a shared enum. Re-verified end to end
+after the merge: a `.wasm` built directly from this repo (no workaround)
+now registers (`discovered: 2, registered: 2`) and runs correctly against
+a real host, real LLM, and the real Otto AI server.
 
 ## Roadmap
 

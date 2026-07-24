@@ -172,7 +172,7 @@ an auditable number.
 ### Live-agent transcript (2026-07-23)
 
 Same real, from-source `zeroclaw` host and real Gemini model as
-`x402-quote-check`'s live test (see its README's "Known risk" note for host
+`x402-quote-check`'s live test (see its README's "Resolved risk" note for host
 build details). Two runs:
 
 1. Asked the agent to pay via `http://127.0.0.1:8899/resource` (a real
@@ -294,18 +294,24 @@ If the cumulative 24h cap would be exceeded instead:
   Do not change `transaction.rs`'s signing model without first inspecting a
   real 402 response's `extra` block from a live server; see `x402.md` in the
   planning repo for the open question.
-- **Known risk: vendored `wit/v0/logging.wit` drift (found 2026-07-23).**
-  Testing against a from-source build of the actual `zeroclaw-labs/zeroclaw`
-  host (v0.8.3) showed the `wit/v0/logging.wit` checked into this repo is
-  missing a `memory-audit` variant on `plugin-action` that the current host
-  already has, which fails component registration entirely
+- **Resolved risk: vendored `wit/v0/logging.wit` drift (found and fixed
+  2026-07-23).** Testing against a from-source build of the actual
+  `zeroclaw-labs/zeroclaw` host (v0.8.3) initially showed the
+  `wit/v0/logging.wit` checked into this repo missing a `memory-audit`
+  variant on `plugin-action` that the host already had (added upstream at
+  `zeroclaw@208091c`, #9258) — component registration failed entirely
   (`discovered: 1, registered: 0`, linker error on
-  `zeroclaw:plugin/logging@0.1.0`). Confirmed in an isolated scratch copy
-  that this plugin registers and runs correctly once the vendored WIT is
-  back in sync — not a bug in this plugin's code, a shared-file vendoring
-  drift that affects every plugin in `zeroclaw-plugins`. Not fixed here
-  since `wit/v0/` is shared repo-wide infrastructure, not this plugin's own
-  code.
+  `zeroclaw:plugin/logging@0.1.0`), affecting every plugin in
+  `zeroclaw-plugins`, not just this one. Reported on the ZeroClaw Discord;
+  independently confirmed by another contributor and root-caused to the
+  exact commit by a maintainer. Fixed by re-syncing `wit/v0/logging.wit`
+  verbatim from `zeroclaw@208091c` (branch `fix/wit-v0-logging-parity`,
+  merged into this branch) — every affected plugin in the repo
+  (`redact-text`, `email`, `mqtt`, `twitch`, both x402 plugins) rebuilt and
+  retested clean first, since the enum is shared. Re-verified after
+  merging: a `.wasm` built directly from this repo now registers
+  (`discovered: 2, registered: 2`) and runs correctly end to end against a
+  real host, real LLM, and the real Otto AI server.
 
 ## Layout (the reference format)
 
