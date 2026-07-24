@@ -123,7 +123,7 @@ fn history_entry_with_amount_larger_than_u64_is_skipped_not_crashed() {
             ]
         }
     });
-    let result = extract_outgoing_transfer(&tx, VALID_SOURCE_TOKEN_ACCOUNT);
+    let result = extract_outgoing_transfer(&tx, VALID_SOURCE_TOKEN_ACCOUNT, 1);
     // Either a clean error/None is acceptable; a panic is not. The real
     // assertion here is that this line above did not already abort the test.
     assert!(result.is_ok() || result.is_err());

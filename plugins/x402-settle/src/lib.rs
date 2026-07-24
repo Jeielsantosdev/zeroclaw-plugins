@@ -34,9 +34,10 @@ mod component {
     use crate::rpc_history::{extract_outgoing_transfer, select_signatures_within_window};
     use crate::transaction::{build_signed_transaction, to_base64};
     use crate::x402_settle::{
-        check_cumulative_cap, decode_session_key_seed, parse_requirements_from_response,
-        session_key_pubkey, validate_requirements, CapVerdict, SettlePolicyConfig, TransferRecord,
-        Verdict, SPL_TOKEN_PROGRAM_ID,
+        build_approval_token, check_cumulative_cap, decode_session_key_seed,
+        parse_requirements_from_response, session_key_pubkey, validate_requirements,
+        verify_approval_token, CapVerdict, SettlePolicyConfig, TransferRecord, Verdict,
+        APPROVAL_WINDOW_SLOTS, SPL_TOKEN_PROGRAM_ID,
     };
     use exports::zeroclaw::plugin::plugin_info::Guest as PluginInfo;
     use exports::zeroclaw::plugin::tool::{Guest as Tool, ToolResult};
@@ -81,6 +82,18 @@ mod component {
     #[derive(serde::Deserialize)]
     struct ExecuteArgs {
         resource_url: String,
+        /// Two-phase approval gate: `"propose"` (default when omitted) never
+        /// signs or submits anything — it validates policy, checks the
+        /// cumulative cap, verifies the destination, and returns an
+        /// `approval_token`. `"confirm"` requires that exact token (still
+        /// fresh) and is the only path that ever signs and submits. See the
+        /// README's "Approval gate" section.
+        #[serde(default)]
+        action: Option<String>,
+        /// Required when `action = "confirm"`: the token a prior `"propose"`
+        /// call returned for this exact payment.
+        #[serde(default)]
+        approval_token: Option<String>,
         #[serde(rename = "__config", default)]
         config: HashMap<String, String>,
     }
@@ -101,11 +114,15 @@ mod component {
         }
 
         fn description() -> String {
-            "Pay for an x402-gated resource. Fetches the resource, validates the server's HTTP \
-             402 payment requirements against operator policy (network, mint, amount, recipient, \
-             timeout), enforces a cumulative 24h spend cap recomputed from real on-chain transfer \
-             history, then builds and signs an SPL token transfer with a scoped session key — \
-             never the operator's main wallet — and retries with proof of payment."
+            "Pay for an x402-gated resource, via a two-phase approval gate. Call with no \
+             `action` (or action=\"propose\") first: fetches the resource, validates the \
+             server's HTTP 402 payment requirements against operator policy (network, mint, \
+             amount, recipient, timeout), enforces a cumulative 24h spend cap recomputed from \
+             real on-chain transfer history, verifies the destination — and returns an \
+             `approval_token`, WITHOUT signing or submitting anything. Only a second call with \
+             action=\"confirm\" and that exact (still-fresh) approval_token builds and signs an \
+             SPL token transfer with a scoped session key — never the operator's main wallet — \
+             and retries with proof of payment."
                 .to_string()
         }
 
@@ -116,6 +133,15 @@ mod component {
                     "resource_url": {
                         "type": "string",
                         "description": "HTTPS URL of the x402-gated resource to pay for."
+                    },
+                    "action": {
+                        "type": "string",
+                        "enum": ["propose", "confirm"],
+                        "description": "\"propose\" (default): validate everything and return an approval_token, never signs or submits. \"confirm\": actually pay — requires the approval_token a prior propose call returned."
+                    },
+                    "approval_token": {
+                        "type": "string",
+                        "description": "Required when action=\"confirm\": the exact approval_token a prior propose call for this same payment returned."
                     }
                 },
                 "required": ["resource_url"],
@@ -125,7 +151,7 @@ mod component {
         }
 
         fn execute(args: String) -> Result<ToolResult, String> {
-            let parsed: ExecuteArgs = match serde_json::from_str(&args) {
+            let mut parsed: ExecuteArgs = match serde_json::from_str(&args) {
                 Ok(a) => a,
                 Err(e) => {
                     emit(
@@ -144,6 +170,32 @@ mod component {
                     "non-https resource_url",
                 );
                 return Ok(deny("resource_url must be an https:// URL".to_string()));
+            }
+
+            // Approval gate: "propose" (the default) validates everything
+            // below and returns an approval_token without ever touching the
+            // session key or signing anything. Only "confirm", with that
+            // exact token, reaches the signing path further down. Checked
+            // here, before any network I/O, so a malformed action/token
+            // fails fast instead of spending RPC calls first.
+            let action = parsed.action.as_deref().unwrap_or("propose");
+            if action != "propose" && action != "confirm" {
+                emit(PluginAction::Fail, PluginOutcome::Failure, "invalid action");
+                return Ok(deny(format!(
+                    "action must be \"propose\" or \"confirm\", got {action:?}"
+                )));
+            }
+            if action == "confirm" && parsed.approval_token.as_deref().unwrap_or("").is_empty() {
+                emit(
+                    PluginAction::Fail,
+                    PluginOutcome::Failure,
+                    "confirm without approval_token",
+                );
+                return Ok(deny(
+                    "approval_token is required when action=\"confirm\" — call with \
+                     action=\"propose\" first to get one"
+                        .to_string(),
+                ));
             }
 
             let cfg = SettlePolicyConfig::from_section(&parsed.config);
@@ -169,36 +221,19 @@ mod component {
                     "session_token_account must be configured (see README limitations)".to_string(),
                 ));
             };
-            let Some(mut session_key_raw) = parsed.config.get("session_key").cloned() else {
+            // Only check that a session_key is *configured* here — it is not
+            // decoded (and never touches the signing path) unless and until
+            // action="confirm" passes its approval-token check below. A
+            // "propose" call never has any reason to touch the secret
+            // material at all.
+            if !parsed.config.contains_key("session_key") {
                 emit(
                     PluginAction::Fail,
                     PluginOutcome::Failure,
                     "no session_key configured",
                 );
                 return Ok(deny("session_key must be configured".to_string()));
-            };
-            let decoded_seed = decode_session_key_seed(&session_key_raw);
-            // The config String has served its purpose the moment decoding is
-            // attempted, whether it succeeded or not — scrub it here rather
-            // than let it drop normally at the end of scope. Found during a
-            // zeroize audit: this was previously left for ordinary Drop.
-            session_key_raw.zeroize();
-            let seed = match decoded_seed {
-                Ok(s) => zeroize::Zeroizing::new(s),
-                Err(e) => {
-                    emit(
-                        PluginAction::Fail,
-                        PluginOutcome::Failure,
-                        "malformed session_key",
-                    );
-                    return Ok(deny(format!("malformed session_key: {e}")));
-                }
-            };
-            // `seed` is `Zeroizing<[u8; 32]>` from here on: it derefs to
-            // `[u8; 32]` everywhere it's used below, and is scrubbed on drop
-            // no matter which of `execute`'s many early-return paths fires
-            // after this point — not just the success path.
-            let fee_payer_pubkey = session_key_pubkey(&seed);
+            }
 
             // Step 1: fetch the resource, expect a 402 challenge.
             let first_resp = match http_get(&parsed.resource_url, None) {
@@ -330,18 +365,9 @@ mod component {
                 CapVerdict::Allow { .. } => {}
             }
 
-            // Step 4: build and sign the transfer.
-            let recent_blockhash = match rpc_get_latest_blockhash(&rpc_url) {
-                Ok(b) => b,
-                Err(e) => {
-                    emit(
-                        PluginAction::Fail,
-                        PluginOutcome::Failure,
-                        "blockhash fetch failed",
-                    );
-                    return Ok(deny(e));
-                }
-            };
+            // Blockhash freshness only matters for a call that will actually
+            // submit — never fetched on the `propose` path, since it would
+            // just go stale waiting for a human to approve.
             let source_bytes = match decode_pubkey(&source_token_account) {
                 Ok(b) => b,
                 Err(e) => {
@@ -415,6 +441,103 @@ mod component {
                         PluginAction::Fail,
                         PluginOutcome::Failure,
                         "internal: SPL_TOKEN_PROGRAM_ID constant failed to decode",
+                    );
+                    return Ok(deny(e));
+                }
+            };
+
+            // Approval gate, part 2: everything above (policy, cumulative
+            // cap, destination verification) has now run against live data.
+            // "propose" stops here — no signing, no submission, nothing
+            // irreversible — and hands back a token that binds this exact
+            // payment to a short expiry window.
+            if action == "propose" {
+                let expires_at_slot = current_slot + APPROVAL_WINDOW_SLOTS;
+                let token = build_approval_token(&req, &source_token_account, expires_at_slot);
+                emit(
+                    PluginAction::Complete,
+                    PluginOutcome::Success,
+                    "proposed, awaiting confirmation",
+                );
+                return Ok(ToolResult {
+                    success: true,
+                    output: format!(
+                        "PROPOSED, NOT YET PAID: {} atomic units of {} to {} on {}. Nothing has \
+                         been signed or submitted. To actually pay, call this tool again with \
+                         action=\"confirm\" and approval_token=\"{token}\" before slot \
+                         {expires_at_slot} (roughly the next 1-2 minutes) — after that this token \
+                         expires and a fresh \"propose\" call is required.",
+                        req.amount_atomic,
+                        req.asset_mint,
+                        req.pay_to,
+                        req.network_label(),
+                    ),
+                    error: None,
+                });
+            }
+
+            // action == "confirm" from here on: the approval_token must
+            // match the payment above and still be within its expiry
+            // window, checked against the same freshly-read current_slot
+            // used for the cumulative cap above — never a cached slot.
+            let approval_token = parsed.approval_token.as_deref().unwrap_or("");
+            if let Err(e) =
+                verify_approval_token(approval_token, &req, &source_token_account, current_slot)
+            {
+                emit(
+                    PluginAction::Fail,
+                    PluginOutcome::Failure,
+                    "approval token rejected",
+                );
+                return Ok(deny(e.to_string()));
+            }
+
+            // Only now, with a valid, fresh, matching approval_token in
+            // hand, does this call ever touch the session key.
+            // .remove() takes ownership out of the map instead of cloning —
+            // cloning would leave an unzeroized copy sitting in
+            // parsed.config until execute() returns.
+            let Some(mut session_key_raw) = parsed.config.remove("session_key") else {
+                emit(
+                    PluginAction::Fail,
+                    PluginOutcome::Failure,
+                    "no session_key configured",
+                );
+                return Ok(deny("session_key must be configured".to_string()));
+            };
+            let decoded_seed = decode_session_key_seed(&session_key_raw);
+            // The config String has served its purpose the moment decoding is
+            // attempted, whether it succeeded or not — scrub it here rather
+            // than let it drop normally at the end of scope. Found during a
+            // zeroize audit: this was previously left for ordinary Drop.
+            session_key_raw.zeroize();
+            let seed = match decoded_seed {
+                Ok(s) => zeroize::Zeroizing::new(s),
+                Err(e) => {
+                    emit(
+                        PluginAction::Fail,
+                        PluginOutcome::Failure,
+                        "malformed session_key",
+                    );
+                    return Ok(deny(format!("malformed session_key: {e}")));
+                }
+            };
+            // `seed` is `Zeroizing<[u8; 32]>` from here on: it derefs to
+            // `[u8; 32]` everywhere it's used below, and is scrubbed on drop
+            // no matter which of `execute`'s remaining early-return paths
+            // fires after this point — not just the success path.
+            let fee_payer_pubkey = session_key_pubkey(&seed);
+
+            // Only fetched now, on the confirm path that will actually
+            // submit — a blockhash fetched during `propose` would just sit
+            // stale while a human reads and approves the request.
+            let recent_blockhash = match rpc_get_latest_blockhash(&rpc_url) {
+                Ok(b) => b,
+                Err(e) => {
+                    emit(
+                        PluginAction::Fail,
+                        PluginOutcome::Failure,
+                        "blockhash fetch failed",
                     );
                     return Ok(deny(e));
                 }
@@ -633,12 +756,18 @@ mod component {
         min_context_slot: u64,
         now_unix: i64,
     ) -> Result<Vec<TransferRecord>, String> {
+        // "confirmed" explicitly, not the RPC's implicit default (typically
+        // "finalized", ~13-19s behind) — narrows, but does not close, the
+        // window in which a burst of fast/concurrent x402_settle calls can
+        // each read the cap before an earlier call's transfer lands. See
+        // the README's threat model, item #8, for what this does and does
+        // not guarantee.
         let signatures_result = rpc_call(
             rpc_url,
             "getSignaturesForAddress",
             serde_json::json!([
                 tracked_token_account,
-                {"limit": SIGNATURES_FETCH_LIMIT, "minContextSlot": min_context_slot}
+                {"limit": SIGNATURES_FETCH_LIMIT, "minContextSlot": min_context_slot, "commitment": "confirmed"}
             ]),
         )?;
         let signatures = signatures_result
@@ -659,10 +788,11 @@ mod component {
                 serde_json::json!([signature, {
                     "encoding": "jsonParsed",
                     "maxSupportedTransactionVersion": 0,
-                    "minContextSlot": min_context_slot
+                    "minContextSlot": min_context_slot,
+                    "commitment": "confirmed"
                 }]),
             )?;
-            match extract_outgoing_transfer(&tx, tracked_token_account) {
+            match extract_outgoing_transfer(&tx, tracked_token_account, now_unix) {
                 Ok(Some(record)) => history.push(record),
                 Ok(None) => {}
                 // The account genuinely isn't referenced by this signature's

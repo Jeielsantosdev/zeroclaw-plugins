@@ -700,6 +700,106 @@ pub fn decode_session_key_seed(raw_base58: &str) -> Result<[u8; 32], String> {
     Ok(seed)
 }
 
+// ---------------------------------------------------------------------------
+// Approval gate — a propose/confirm split enforced inside this plugin
+// ---------------------------------------------------------------------------
+
+/// How many slots an approval token stays valid before a fresh `propose`
+/// call is required. ~200 slots is roughly 80-120s on Solana mainnet/devnet
+/// (~400-600ms/slot) — long enough for a human to read a chat message and
+/// reply, short enough that a stale, previously-seen token can't be replayed
+/// against a since-changed cap or price.
+pub const APPROVAL_WINDOW_SLOTS: u64 = 200;
+
+/// A confirmation code binding one exact payment (network, mint, recipient,
+/// amount, and the paying account) to an expiry slot. Deliberately plain
+/// text, not a cryptographic hash: nothing in it is secret, and a legible
+/// code is easier for a human approver to sanity-check inside a chat message
+/// than an opaque blob would be — its security value comes entirely from
+/// requiring a second, explicit `execute()` call (`action = "confirm"`) with
+/// this exact string before this plugin ever signs anything. This is the
+/// approval gate the bounty's checklist asks for ("spend limits, a mint
+/// allowlist, **and an approval gate**", all inside the plugin) — layered on
+/// top of, never a replacement for, the host's own `[Y/N/A]` prompt.
+pub fn build_approval_token(
+    req: &PaymentRequirement,
+    source_token_account: &str,
+    expires_at_slot: u64,
+) -> String {
+    format!(
+        "v1:{}:{}:{}:{}:{}:{}",
+        req.network_label(),
+        req.asset_mint,
+        req.pay_to,
+        req.amount_atomic,
+        source_token_account,
+        expires_at_slot
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApprovalError {
+    Malformed,
+    Expired {
+        expires_at_slot: u64,
+        current_slot: u64,
+    },
+    Mismatch,
+}
+
+impl std::fmt::Display for ApprovalError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ApprovalError::Malformed => write!(
+                f,
+                "approval_token is malformed — call again with action=\"propose\" to get a fresh one"
+            ),
+            ApprovalError::Expired {
+                expires_at_slot,
+                current_slot,
+            } => write!(
+                f,
+                "approval_token expired at slot {expires_at_slot} (current slot is {current_slot}) \
+                 — call again with action=\"propose\" to get a fresh one"
+            ),
+            ApprovalError::Mismatch => write!(
+                f,
+                "approval_token does not match this payment's requirements — it may be stale or \
+                 for a different payment; call again with action=\"propose\""
+            ),
+        }
+    }
+}
+
+/// Verify a token produced by `build_approval_token` against the payment
+/// being confirmed *right now*. `current_slot` must be freshly read from the
+/// chain by the caller for every `confirm` call — never cached — so an
+/// expired token can't be revived by an attacker controlling only the
+/// plugin's inputs, not the chain's clock.
+pub fn verify_approval_token(
+    token: &str,
+    req: &PaymentRequirement,
+    source_token_account: &str,
+    current_slot: u64,
+) -> Result<(), ApprovalError> {
+    let expires_at_slot: u64 = token
+        .rsplit(':')
+        .next()
+        .and_then(|s| s.parse().ok())
+        .ok_or(ApprovalError::Malformed)?;
+    if current_slot > expires_at_slot {
+        return Err(ApprovalError::Expired {
+            expires_at_slot,
+            current_slot,
+        });
+    }
+    let expected = build_approval_token(req, source_token_account, expires_at_slot);
+    if expected != token {
+        return Err(ApprovalError::Mismatch);
+    }
+    Ok(())
+}
+
 /// The session key's public key, derived from its seed. Safe to log — unlike
 /// the seed itself, a public key reveals nothing that helps an attacker.
 pub fn session_key_pubkey(seed: &[u8; 32]) -> [u8; 32] {
@@ -1110,5 +1210,108 @@ mod tests {
                 "length {len} is neither a bare seed (32) nor a standard keypair export (64)"
             );
         }
+    }
+
+    // ---- approval gate: propose/confirm token ----
+
+    fn sample_req() -> PaymentRequirement {
+        PaymentRequirement {
+            network: SolanaCluster::Mainnet,
+            asset_mint: DEFAULT_MAINNET_USDC_MINT.to_string(),
+            amount_atomic: 1_000_000,
+            pay_to: VALID_PAYTO.to_string(),
+            max_timeout_seconds: Some(30),
+            source_shape: "test",
+        }
+    }
+
+    #[test]
+    fn approval_token_confirms_when_fresh_and_matching() {
+        let req = sample_req();
+        let token = build_approval_token(&req, VALID_SOURCE_TOKEN_ACCOUNT, 1_000_200);
+        assert_eq!(
+            verify_approval_token(&token, &req, VALID_SOURCE_TOKEN_ACCOUNT, 1_000_100),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn approval_token_confirms_at_the_exact_expiry_slot() {
+        let req = sample_req();
+        let token = build_approval_token(&req, VALID_SOURCE_TOKEN_ACCOUNT, 1_000_200);
+        assert_eq!(
+            verify_approval_token(&token, &req, VALID_SOURCE_TOKEN_ACCOUNT, 1_000_200),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn approval_token_rejects_one_slot_past_expiry() {
+        let req = sample_req();
+        let token = build_approval_token(&req, VALID_SOURCE_TOKEN_ACCOUNT, 1_000_200);
+        assert_eq!(
+            verify_approval_token(&token, &req, VALID_SOURCE_TOKEN_ACCOUNT, 1_000_201),
+            Err(ApprovalError::Expired {
+                expires_at_slot: 1_000_200,
+                current_slot: 1_000_201,
+            })
+        );
+    }
+
+    #[test]
+    fn approval_token_rejects_a_different_amount_than_it_was_issued_for() {
+        let req = sample_req();
+        let token = build_approval_token(&req, VALID_SOURCE_TOKEN_ACCOUNT, 1_000_200);
+        let mut bumped_req = req.clone();
+        bumped_req.amount_atomic += 1;
+        assert_eq!(
+            verify_approval_token(&token, &bumped_req, VALID_SOURCE_TOKEN_ACCOUNT, 1_000_100),
+            Err(ApprovalError::Mismatch),
+            "a token issued for one amount must not confirm a payment for a different amount"
+        );
+    }
+
+    #[test]
+    fn approval_token_rejects_a_different_destination_than_it_was_issued_for() {
+        let req = sample_req();
+        let token = build_approval_token(&req, VALID_SOURCE_TOKEN_ACCOUNT, 1_000_200);
+        let mut redirected_req = req.clone();
+        redirected_req.pay_to = VALID_OWNER.to_string();
+        assert_eq!(
+            verify_approval_token(
+                &token,
+                &redirected_req,
+                VALID_SOURCE_TOKEN_ACCOUNT,
+                1_000_100
+            ),
+            Err(ApprovalError::Mismatch),
+            "a token issued for one recipient must not confirm a payment to a different one"
+        );
+    }
+
+    #[test]
+    fn approval_token_rejects_garbage_input() {
+        let req = sample_req();
+        assert_eq!(
+            verify_approval_token("not-a-real-token", &req, VALID_SOURCE_TOKEN_ACCOUNT, 1),
+            Err(ApprovalError::Malformed)
+        );
+        assert_eq!(
+            verify_approval_token("", &req, VALID_SOURCE_TOKEN_ACCOUNT, 1),
+            Err(ApprovalError::Malformed)
+        );
+    }
+
+    #[test]
+    fn approval_token_rejects_a_token_forged_for_a_different_session_token_account() {
+        // Same payment requirements, but issued against a different paying
+        // account than the one confirming — must not cross-authorize.
+        let req = sample_req();
+        let token =
+            build_approval_token(&req, "SomeOtherTokenAccount11111111111111111111", 1_000_200);
+        assert_eq!(
+            verify_approval_token(&token, &req, VALID_SOURCE_TOKEN_ACCOUNT, 1_000_100),
+            Err(ApprovalError::Mismatch)
+        );
     }
 }

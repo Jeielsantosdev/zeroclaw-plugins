@@ -35,6 +35,10 @@ use crate::x402_settle::{TransferRecord, CUMULATIVE_WINDOW_SECONDS};
 /// them would defeat the entire purpose of the cumulative cap this feeds,
 /// so an inability to fully verify spend must itself deny the payment, not
 /// degrade to "probably fine."
+///
+/// Scans the whole list instead of stopping at the first stale-looking
+/// entry — a malicious RPC could plant an out-of-order entry to trigger an
+/// early stop and hide real in-window signatures after it.
 pub fn select_signatures_within_window(
     signatures: &[serde_json::Value],
     now_unix: i64,
@@ -47,12 +51,9 @@ pub fn select_signatures_within_window(
             continue;
         };
         match entry.get("blockTime").and_then(|b| b.as_i64()) {
-            // Newest-first ordering: once one entry is older than the
-            // window, every remaining entry is too — stop scanning.
-            Some(block_time) if block_time <= window_start => break,
-            // A missing blockTime is not proof the entry is old — be
-            // conservative and still inspect it rather than assume it's
-            // out of window.
+            Some(block_time) if block_time <= window_start => continue,
+            // A missing blockTime is not proof the entry is old — inspect
+            // it rather than assume it's out of window.
             _ => selected.push(signature),
         }
     }
@@ -87,6 +88,7 @@ pub enum HistoryParseError {
 pub fn extract_outgoing_transfer(
     tx: &serde_json::Value,
     tracked_token_account: &str,
+    now_unix: i64,
 ) -> Result<Option<TransferRecord>, HistoryParseError> {
     let account_keys = tx
         .get("transaction")
@@ -123,7 +125,13 @@ pub fn extract_outgoing_transfer(
     }
 
     let amount_atomic = pre - post;
-    let unix_timestamp = tx.get("blockTime").and_then(|b| b.as_i64()).unwrap_or(0);
+    // A missing blockTime defaults to "now", not 0 — 0 would push the
+    // record outside the 24h window and drop it from the cumulative sum,
+    // under-counting real spend instead of counting it conservatively.
+    let unix_timestamp = tx
+        .get("blockTime")
+        .and_then(|b| b.as_i64())
+        .unwrap_or(now_unix);
 
     Ok(Some(TransferRecord {
         amount_atomic,
@@ -184,7 +192,7 @@ mod tests {
     #[test]
     fn extracts_outgoing_transfer_amount_and_timestamp() {
         let tx = tx_with_balances(TRACKED, "10000000", "9000000", 1_700_000_000);
-        let record = extract_outgoing_transfer(&tx, TRACKED)
+        let record = extract_outgoing_transfer(&tx, TRACKED, 1_700_000_000)
             .expect("should parse")
             .expect("should be Some — balance decreased");
         assert_eq!(record.amount_atomic, 1_000_000);
@@ -194,29 +202,58 @@ mod tests {
     #[test]
     fn incoming_transfer_is_not_counted_as_outgoing() {
         let tx = tx_with_balances(TRACKED, "9000000", "10000000", 1_700_000_000);
-        let record = extract_outgoing_transfer(&tx, TRACKED).expect("should parse");
+        let record = extract_outgoing_transfer(&tx, TRACKED, 1_700_000_000).expect("should parse");
         assert!(record.is_none(), "balance increase must not count as spend");
     }
 
     #[test]
     fn unchanged_balance_is_not_counted() {
         let tx = tx_with_balances(TRACKED, "5000000", "5000000", 1_700_000_000);
-        let record = extract_outgoing_transfer(&tx, TRACKED).expect("should parse");
+        let record = extract_outgoing_transfer(&tx, TRACKED, 1_700_000_000).expect("should parse");
         assert!(record.is_none());
     }
 
     #[test]
     fn account_not_referenced_is_reported_distinctly() {
         let tx = tx_with_balances("SomeUnrelatedAccount111111111111111111111", "1", "0", 1);
-        let err = extract_outgoing_transfer(&tx, TRACKED).unwrap_err();
+        let err = extract_outgoing_transfer(&tx, TRACKED, 1).unwrap_err();
         assert_eq!(err, HistoryParseError::AccountNotReferenced);
     }
 
     #[test]
     fn malformed_response_fails_closed_not_a_transaction() {
         let garbage = json!({ "not": "a transaction" });
-        let err = extract_outgoing_transfer(&garbage, TRACKED).unwrap_err();
+        let err = extract_outgoing_transfer(&garbage, TRACKED, 1).unwrap_err();
         assert_eq!(err, HistoryParseError::NotATransaction);
+    }
+
+    #[test]
+    fn missing_block_time_falls_back_to_now_not_zero() {
+        let tx = json!({
+            "transaction": {
+                "message": {
+                    "accountKeys": [
+                        { "pubkey": TRACKED, "signer": false, "writable": true },
+                    ]
+                }
+            },
+            "meta": {
+                "preTokenBalances": [
+                    { "accountIndex": 0, "uiTokenAmount": { "amount": "10" } }
+                ],
+                "postTokenBalances": [
+                    { "accountIndex": 0, "uiTokenAmount": { "amount": "9" } }
+                ]
+            }
+        });
+        let record = extract_outgoing_transfer(&tx, TRACKED, 1_700_000_000)
+            .expect("should parse")
+            .expect("balance decreased");
+        assert_eq!(
+            record.unix_timestamp, 1_700_000_000,
+            "a missing blockTime must count as 'now', not epoch 0 — 0 would push the \
+             record out of the 24h window and silently drop it from the cumulative sum"
+        );
     }
 
     #[test]
@@ -235,7 +272,7 @@ mod tests {
                 "postTokenBalances": []
             }
         });
-        let record = extract_outgoing_transfer(&tx, TRACKED).expect("should parse");
+        let record = extract_outgoing_transfer(&tx, TRACKED, 1).expect("should parse");
         assert!(record.is_none());
     }
 
@@ -284,10 +321,13 @@ mod tests {
             }
         });
 
-        let record =
-            extract_outgoing_transfer(&real_tx, "5YGHhGV7L7gfL4aDBXrs3V6nLb7Kpkk9YFX8vg5rqGbN")
-                .expect("must parse a real devnet response")
-                .expect("balance genuinely decreased in this real transaction");
+        let record = extract_outgoing_transfer(
+            &real_tx,
+            "5YGHhGV7L7gfL4aDBXrs3V6nLb7Kpkk9YFX8vg5rqGbN",
+            1784757866,
+        )
+        .expect("must parse a real devnet response")
+        .expect("balance genuinely decreased in this real transaction");
         assert_eq!(record.amount_atomic, 1);
         assert_eq!(record.unix_timestamp, 1784757866);
     }
@@ -319,17 +359,20 @@ mod tests {
     }
 
     #[test]
-    fn select_signatures_within_window_stops_at_the_first_stale_entry() {
+    fn select_signatures_within_window_skips_stale_entries_wherever_they_sit() {
         let now = 100_000i64;
         let window_start = now - CUMULATIVE_WINDOW_SECONDS;
         let signatures = vec![
             sig("newest", now - 10),
             sig("also_recent", now - 20),
-            sig("exactly_at_boundary", window_start), // <= window_start: stale
-            sig("would_have_been_in_window_but_never_scanned", now - 1), // must never be reached
+            sig("exactly_at_boundary", window_start), // stale
+            sig("out_of_order_but_in_window", now - 1),
         ];
         let selected = select_signatures_within_window(&signatures, now, 100).unwrap();
-        assert_eq!(selected, vec!["newest", "also_recent"]);
+        assert_eq!(
+            selected,
+            vec!["newest", "also_recent", "out_of_order_but_in_window"]
+        );
     }
 
     #[test]
