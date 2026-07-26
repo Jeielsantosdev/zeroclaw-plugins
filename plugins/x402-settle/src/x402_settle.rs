@@ -40,12 +40,26 @@ pub(crate) const SPL_TOKEN_TRANSFER_TAG: u8 = 3;
 // Requirement parsing and policy validation (duplicated from x402-quote-check)
 // ---------------------------------------------------------------------------
 
-/// CAIP-2 genesis hashes for the two clusters this plugin recognizes.
-/// Confirmed against live x402 Solana servers (Otto AI, Syra — both emit
-/// `network: "solana:<genesis-hash>"` in their `accepts[]` entries, not the
-/// flat "solana-mainnet" string). See the README for the source.
+/// Full, untruncated base58 genesis hashes for the two clusters this plugin
+/// recognizes. Kept for documentation/provenance; comparisons use the
+/// CAIP-2 truncated form below, since that is what real servers actually
+/// send (see the `_CAIP2` constants).
 pub const MAINNET_GENESIS_HASH: &str = "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d";
 pub const DEVNET_GENESIS_HASH: &str = "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG";
+
+/// CAIP-2 chain references, capped at 32 chars by the CAIP-2 grammar
+/// itself. The Solana CAIP-2 namespace spec (`ChainAgnostic/namespaces`,
+/// `solana/caip2.md`) mandates `truncate(genesisHash, 32)` as the reference
+/// value — servers are not malformed or buggy for sending this; it is the
+/// only spec-conformant form. Confirmed against two independent live x402
+/// servers doing exactly this: Otto AI (mainnet, `solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp`)
+/// and PayAI's Echo Merchant (devnet, `solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1`).
+/// An earlier version of this plugin treated the truncated form as an
+/// unrecognized/malformed network and always fell through to `Other`,
+/// which meant it could never produce a GO against any real-world CAIP-2
+/// x402 server, on either network — not a security feature, a bug.
+pub const MAINNET_GENESIS_HASH_CAIP2: &str = "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp";
+pub const DEVNET_GENESIS_HASH_CAIP2: &str = "EtWTRABZaYq6iMfeYKouRu166VU2xqa1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SolanaCluster {
@@ -64,10 +78,10 @@ impl SolanaCluster {
             _ => {}
         }
         if let Some(genesis_hash) = trimmed.strip_prefix("solana:") {
-            if genesis_hash == MAINNET_GENESIS_HASH {
+            if genesis_hash == MAINNET_GENESIS_HASH_CAIP2 || genesis_hash == MAINNET_GENESIS_HASH {
                 return SolanaCluster::Mainnet;
             }
-            if genesis_hash == DEVNET_GENESIS_HASH {
+            if genesis_hash == DEVNET_GENESIS_HASH_CAIP2 || genesis_hash == DEVNET_GENESIS_HASH {
                 return SolanaCluster::Devnet;
             }
         }

@@ -54,33 +54,38 @@ fn real_otto_ai_header_parses_and_selects_the_solana_leg_not_the_first_evm_one()
 }
 
 #[test]
-fn real_otto_ai_solana_leg_has_a_nonstandard_truncated_genesis_hash() {
+fn real_otto_ai_solana_leg_genesis_hash_is_caip2_truncated_by_spec_not_malformed() {
+    // The CAIP-2 Solana namespace spec (ChainAgnostic/namespaces,
+    // solana/caip2.md) mandates `truncate(genesisHash, 32)` as the chain
+    // reference — CAIP-2 itself caps chain references at 32 chars, so
+    // Otto AI's 32-char form is spec-conformant, not malformed. Treating
+    // it as unrecognized was a real bug (fixed 2026-07-26) that made this
+    // plugin unable to ever produce a GO against any real-world
+    // CAIP-2-compliant x402 server.
     let truncated = "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp";
-    match SolanaCluster::parse(truncated) {
-        SolanaCluster::Other(_) => {}
-        other => panic!(
-            "expected the truncated genesis hash to fall through to Other \
-             (fail closed), got {other:?} instead"
-        ),
-    }
+    assert_eq!(
+        SolanaCluster::parse(truncated),
+        SolanaCluster::Mainnet,
+        "the CAIP-2-truncated genesis hash must resolve to Mainnet"
+    );
 }
 
 #[test]
-fn end_to_end_no_go_against_real_otto_ai_response_nonstandard_genesis_hash() {
+fn end_to_end_go_against_real_otto_ai_response_after_caip2_fix() {
+    // Every field in this real, captured response is well within the
+    // default policy (amount 1000 < 5_000_000 cap, timeout 300s == the
+    // 300s cap, asset matches the default mainnet USDC mint) once the
+    // CAIP-2 network fix correctly resolves the network to Mainnet — so
+    // the correct verdict is GO. Before the fix this incorrectly came
+    // back NO-GO on "network mismatch" for every real Solana x402 offer,
+    // not just malformed ones.
     let cfg = SettlePolicyConfig::from_section(&section(&[]));
     let req = parse_requirements_from_response(Some(OTTO_HEADER.trim()), OTTO_BODY.trim())
         .expect("header path should parse the real Otto AI 402");
     match validate_requirements(&req, &cfg) {
-        Verdict::NoGo { reasons } => {
-            assert!(
-                reasons.iter().any(|r| r.contains("network mismatch")),
-                "expected a network-mismatch reason for the truncated genesis \
-                 hash, got: {reasons:?}"
-            );
-        }
-        Verdict::Go { .. } => panic!(
-            "expected NO-GO: Otto AI's Solana leg network field does not match \
-             the real mainnet genesis hash"
+        Verdict::Go { .. } => {}
+        Verdict::NoGo { reasons } => panic!(
+            "expected GO against this real, well-formed Otto AI offer, got NO-GO: {reasons:?}"
         ),
     }
 }
