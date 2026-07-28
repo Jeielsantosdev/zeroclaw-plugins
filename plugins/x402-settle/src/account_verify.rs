@@ -32,6 +32,10 @@ pub enum AccountVerifyError {
     /// The account is a token account, but for a different mint than the
     /// one this payment is supposed to use.
     MintMismatch { expected: String, actual: String },
+    /// The account is owned by the SPL Token program but is not decoded as
+    /// a mint account by the RPC's own parser (e.g. it's a token account,
+    /// not a mint) — returned by `extract_mint_decimals` only.
+    NotAParsedMintAccount,
     /// The response didn't match the expected shape at all — fail closed
     /// rather than guess.
     MalformedResponse,
@@ -54,6 +58,9 @@ impl std::fmt::Display for AccountVerifyError {
                 f,
                 "destination token account is for mint {actual:?}, expected {expected:?}"
             ),
+            AccountVerifyError::NotAParsedMintAccount => {
+                write!(f, "asset_mint account is not a parsed SPL mint account")
+            }
             AccountVerifyError::MalformedResponse => {
                 write!(
                     f,
@@ -116,6 +123,56 @@ pub fn verify_token_account(
             }
         }
         _ => Err(AccountVerifyError::NotAParsedTokenAccount),
+    }
+}
+
+/// Read `decimals` from `getAccountInfo`'s (jsonParsed) response for the
+/// payment's asset mint. Required to build a spec-correct `TransferChecked`
+/// instruction (`transaction.rs`) — the x402 v2 "exact" scheme requires
+/// `TransferChecked` in place of a plain `Transfer` precisely because it
+/// validates decimals on-chain. The x402 payment-requirements response never
+/// carries decimals itself (confirmed absent from every real response
+/// captured this session — Otto AI, PayAI Echo Merchant), so this must come
+/// from the chain: hardcoding 6 on the assumption "USDC always has 6
+/// decimals" would silently build a wrong instruction for any other
+/// configured mint.
+pub fn extract_mint_decimals(account_info: &serde_json::Value) -> Result<u8, AccountVerifyError> {
+    let value = account_info
+        .get("value")
+        .ok_or(AccountVerifyError::MalformedResponse)?;
+    if value.is_null() {
+        return Err(AccountVerifyError::AccountDoesNotExist);
+    }
+
+    let owner = value
+        .get("owner")
+        .and_then(|o| o.as_str())
+        .ok_or(AccountVerifyError::MalformedResponse)?;
+    if owner != SPL_TOKEN_PROGRAM_ID {
+        return Err(AccountVerifyError::NotOwnedBySplToken {
+            actual_owner: owner.to_string(),
+        });
+    }
+
+    let program = value
+        .get("data")
+        .and_then(|d| d.get("program"))
+        .and_then(|p| p.as_str());
+    let parsed_type = value
+        .get("data")
+        .and_then(|d| d.get("parsed"))
+        .and_then(|p| p.get("type"))
+        .and_then(|t| t.as_str());
+    let decimals = value
+        .get("data")
+        .and_then(|d| d.get("parsed"))
+        .and_then(|p| p.get("info"))
+        .and_then(|i| i.get("decimals"))
+        .and_then(|d| d.as_u64());
+
+    match (program, parsed_type, decimals) {
+        (Some("spl-token"), Some("mint"), Some(d)) if d <= u8::MAX as u64 => Ok(d as u8),
+        _ => Err(AccountVerifyError::NotAParsedMintAccount),
     }
 }
 
@@ -305,5 +362,48 @@ mod tests {
             .unwrap_err(),
             AccountVerifyError::NotAParsedTokenAccount
         );
+
+        // The same real response, read through extract_mint_decimals
+        // instead: this is exactly the shape it must accept.
+        assert_eq!(extract_mint_decimals(&real_mint_response), Ok(6));
+    }
+
+    #[test]
+    fn extract_mint_decimals_rejects_a_token_account_as_not_a_mint() {
+        // The inverse of the test above: a genuine token account (type
+        // "account", not "mint") must not be misread as a mint just because
+        // both are owned by the SPL Token program.
+        let token_account_response = valid_token_account_response(USDC_MINT);
+        assert_eq!(
+            extract_mint_decimals(&token_account_response).unwrap_err(),
+            AccountVerifyError::NotAParsedMintAccount
+        );
+    }
+
+    #[test]
+    fn extract_mint_decimals_rejects_nonexistent_account() {
+        let resp = json!({ "context": { "slot": 1 }, "value": null });
+        assert_eq!(
+            extract_mint_decimals(&resp).unwrap_err(),
+            AccountVerifyError::AccountDoesNotExist
+        );
+    }
+
+    #[test]
+    fn extract_mint_decimals_rejects_account_not_owned_by_token_program() {
+        let resp = json!({
+            "context": { "slot": 1 },
+            "value": {
+                "owner": "11111111111111111111111111111111",
+                "lamports": 5000,
+                "data": { "program": "system", "parsed": { "type": "account", "info": {} } }
+            }
+        });
+        match extract_mint_decimals(&resp) {
+            Err(AccountVerifyError::NotOwnedBySplToken { actual_owner }) => {
+                assert_eq!(actual_owner, "11111111111111111111111111111111")
+            }
+            other => panic!("expected NotOwnedBySplToken, got {other:?}"),
+        }
     }
 }

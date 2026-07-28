@@ -13,11 +13,11 @@
 use std::collections::HashMap;
 
 use x402_settle::rpc_history::extract_outgoing_transfer;
-use x402_settle::transaction::build_signed_transaction;
+use x402_settle::transaction::build_transfer_checked_transaction;
 use x402_settle::x402_settle::{
-    build_transfer_instruction, check_cumulative_cap, decode_session_key_seed, parse_requirements,
+    check_cumulative_cap, decode_pubkey, decode_session_key_seed, parse_requirements,
     session_key_pubkey, sign_message, validate_requirements, CapVerdict, SettlePolicyConfig,
-    TransferRecord, Verdict, DEFAULT_MAINNET_USDC_MINT,
+    TransferRecord, Verdict, DEFAULT_MAINNET_USDC_MINT, SPL_TOKEN_PROGRAM_ID,
 };
 
 fn section(pairs: &[(&str, &str)]) -> HashMap<String, String> {
@@ -192,41 +192,49 @@ fn all_ff_session_key_seed_still_signs_verifiably_no_crash() {
 
 #[test]
 fn mismatched_fee_payer_pubkey_produces_a_transaction_that_fails_to_verify() {
-    // build_signed_transaction's signature is a documented internal
-    // invariant: takes a seed AND a separately-passed fee_payer_pubkey, and
-    // trusts the caller to keep them consistent (lib.rs always derives
-    // fee_payer_pubkey = session_key_pubkey(&seed) immediately before
-    // calling this). This test proves what happens if a future change ever
-    // breaks that invariant: the built transaction's signature does NOT
-    // verify against the (wrong) pubkey embedded in the message — it fails
-    // safely on-chain (invalid signature), rather than silently succeeding
-    // with the wrong signer, which is the property that actually matters.
+    // build_transfer_checked_transaction's signature is a documented
+    // internal invariant: takes a seed AND a separately-passed
+    // authority_pubkey, and trusts the caller to keep them consistent
+    // (lib.rs always derives authority_pubkey = session_key_pubkey(&seed)
+    // immediately before calling this). This test proves what happens if a
+    // future change ever breaks that invariant: the built transaction's
+    // signature does NOT verify against the (wrong) pubkey embedded in the
+    // message — it fails safely on-chain (invalid signature), rather than
+    // silently succeeding with the wrong signer, which is the property that
+    // actually matters.
     let real_seed = [11u8; 32];
     let wrong_pubkey = session_key_pubkey(&[22u8; 32]); // a DIFFERENT key's pubkey
     let source = [1u8; 32];
     let destination = [2u8; 32];
-    let program_id = [3u8; 32];
+    let mint = [5u8; 32];
+    let program_id = decode_pubkey("test", SPL_TOKEN_PROGRAM_ID).unwrap();
     let blockhash = [4u8; 32];
 
-    let tx = build_signed_transaction(
+    let tx_bytes = build_transfer_checked_transaction(
         &real_seed,
-        wrong_pubkey,
+        wrong_pubkey, // authority_pubkey does NOT correspond to real_seed
+        wrong_pubkey, // self-funded fallback: fee payer == authority
         source,
         destination,
+        mint,
         program_id,
         1,
+        6,
         blockhash,
-    );
+    )
+    .expect("build succeeds structurally even though the invariant is broken");
 
-    let signature_bytes: [u8; 64] = tx[1..65].try_into().unwrap();
-    let message_bytes = &tx[65..];
+    let tx: solana_transaction::Transaction =
+        bincode::deserialize(&tx_bytes).expect("must decode as a Transaction");
+    let message_bytes = bincode::serialize(&tx.message).expect("message must serialize");
 
     use ed25519_dalek::{Signature, Verifier, VerifyingKey};
     let embedded_pubkey = VerifyingKey::from_bytes(&wrong_pubkey).unwrap();
+    let signature_bytes: [u8; 64] = tx.signatures[0].as_ref().try_into().unwrap();
     let signature = Signature::from_bytes(&signature_bytes);
     assert!(
-        embedded_pubkey.verify(message_bytes, &signature).is_err(),
-        "a transaction signed by a different key than the one embedded as fee payer must fail to verify — \
+        embedded_pubkey.verify(&message_bytes, &signature).is_err(),
+        "a transaction signed by a different key than the one embedded as authority must fail to verify — \
          this is what protects against the invariant being silently broken elsewhere"
     );
 }
@@ -238,22 +246,27 @@ fn signature_does_not_verify_against_a_tampered_amount() {
     // amount differently before submission), the signature must not verify.
     let seed = [5u8; 32];
     let pubkey = session_key_pubkey(&seed);
-    let tx = build_signed_transaction(
-        &seed, pubkey, [1u8; 32], [2u8; 32], [3u8; 32], 1_000_000, [6u8; 32],
-    );
+    let program_id = decode_pubkey("test", SPL_TOKEN_PROGRAM_ID).unwrap();
+    let tx_bytes = build_transfer_checked_transaction(
+        &seed, pubkey, pubkey, [1u8; 32], [2u8; 32], [5u8; 32], program_id, 1_000_000, 6, [6u8; 32],
+    )
+    .expect("build must succeed");
 
-    let signature_bytes: [u8; 64] = tx[1..65].try_into().unwrap();
-    let mut tampered_message = tx[65..].to_vec();
-    // Flip a byte inside the instruction data's amount field (the last 8
-    // bytes of the message in this fixed shape).
-    let last = tampered_message.len() - 1;
-    tampered_message[last] ^= 0xFF;
+    let mut tx: solana_transaction::Transaction =
+        bincode::deserialize(&tx_bytes).expect("must decode as a Transaction");
+    // Flip a byte inside the TransferChecked instruction data (the amount
+    // field lives in the tail of this instruction's data).
+    let last_ix = tx.message.instructions.last_mut().unwrap();
+    let last_byte = last_ix.data.len() - 1;
+    last_ix.data[last_byte] ^= 0xFF;
+    let tampered_message_bytes = bincode::serialize(&tx.message).expect("message must serialize");
 
     use ed25519_dalek::{Signature, Verifier, VerifyingKey};
     let vk = VerifyingKey::from_bytes(&pubkey).unwrap();
+    let signature_bytes: [u8; 64] = tx.signatures[0].as_ref().try_into().unwrap();
     let signature = Signature::from_bytes(&signature_bytes);
     assert!(
-        vk.verify(&tampered_message, &signature).is_err(),
+        vk.verify(&tampered_message_bytes, &signature).is_err(),
         "a signature must not verify against a message that was altered after signing"
     );
 }
@@ -266,18 +279,18 @@ fn signature_does_not_verify_against_a_tampered_amount() {
 
 #[test]
 fn oversized_destination_pubkey_is_rejected_in_bounded_time() {
+    // build_transfer_instruction was removed in favor of spl-token's own
+    // (upstream-tested) instruction builder — see transaction.rs — but the
+    // bounded-time DoS guard this test cares about lives one layer down, in
+    // decode_pubkey itself (shared by every pubkey-shaped field, including
+    // destination_token_account before it ever reaches transaction-building).
     let huge_destination = "A".repeat(1_000_000);
     let start = std::time::Instant::now();
-    let result = build_transfer_instruction(
-        VALID_SOURCE_TOKEN_ACCOUNT,
-        &huge_destination,
-        VALID_PAYTO,
-        1,
-    );
+    let result = decode_pubkey("destination_token_account", &huge_destination);
     let elapsed = start.elapsed();
     assert!(
         elapsed.as_secs() < 2,
-        "building a transfer instruction with a 1MB destination took {elapsed:?} — \
+        "decoding a 1MB destination pubkey took {elapsed:?} — \
          the O(n^2) bs58::decode DoS guard has regressed"
     );
     assert!(

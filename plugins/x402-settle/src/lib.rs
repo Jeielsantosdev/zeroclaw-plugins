@@ -4,7 +4,7 @@
 //! resource, validates the server's payment requirements against operator
 //! policy, enforces a cumulative 24h spend cap recomputed from real on-chain
 //! transfer history, builds and signs an SPL Token Transfer, and retries the
-//! resource request with the `X-Payment` proof. See [`x402_settle`] for the
+//! resource request with the `PAYMENT-SIGNATURE` proof. See [`x402_settle`] for the
 //! tested policy/signing core, [`transaction`] for manual Solana transaction
 //! serialization, [`rpc_history`] for turning RPC responses into spend
 //! records, and [`account_verify`] for the pre-signing destination check.
@@ -13,6 +13,7 @@
 //!         cargo build --target wasm32-wasip2 --release
 
 pub mod account_verify;
+pub mod associated_token;
 pub mod rpc_history;
 pub mod transaction;
 pub mod x402_settle;
@@ -30,14 +31,15 @@ mod component {
 
     use zeroize::Zeroize;
 
-    use crate::account_verify::verify_token_account;
+    use crate::account_verify::{extract_mint_decimals, verify_token_account};
+    use crate::associated_token::derive_associated_token_address;
     use crate::rpc_history::{extract_outgoing_transfer, select_signatures_within_window};
-    use crate::transaction::{build_signed_transaction, to_base64};
+    use crate::transaction::{build_transfer_checked_transaction, to_base64};
     use crate::x402_settle::{
         build_approval_token, check_cumulative_cap, decode_session_key_seed,
         parse_requirements_from_response, session_key_pubkey, validate_requirements,
-        verify_approval_token, CapVerdict, SettlePolicyConfig, TransferRecord, Verdict,
-        APPROVAL_WINDOW_SLOTS, SPL_TOKEN_PROGRAM_ID,
+        verify_approval_token, CapVerdict, PaymentRequirement, SettlePolicyConfig, TransferRecord,
+        Verdict, APPROVAL_WINDOW_SLOTS, DEFAULT_MAX_TIMEOUT_SECONDS, SPL_TOKEN_PROGRAM_ID,
     };
     use exports::zeroclaw::plugin::plugin_info::Guest as PluginInfo;
     use exports::zeroclaw::plugin::tool::{Guest as Tool, ToolResult};
@@ -379,7 +381,7 @@ mod component {
                     return Ok(deny(e));
                 }
             };
-            let destination_bytes = match decode_pubkey(&req.pay_to) {
+            let payto_bytes = match decode_pubkey(&req.pay_to) {
                 Ok(b) => b,
                 Err(e) => {
                     emit(
@@ -391,16 +393,56 @@ mod component {
                 }
             };
 
-            // Step 3.5: verify the destination is a real, correctly-owned
-            // token account for the accepted mint *before* ever signing.
-            // Closes a SOL-fee-griefing gap found during the second audit
-            // pass: a server-supplied payTo that passes the base58/length
-            // shape check but isn't actually an initialized SPL token
-            // account would still let us sign a transaction whose
-            // instruction is doomed to fail on-chain — and Solana can still
-            // charge the fee payer (this session key) the base SOL fee for
-            // a submitted-but-failing transaction, a cost the token-
-            // denominated spend caps don't track at all.
+            // SPL_TOKEN_PROGRAM_ID is a fixed, compile-time-known constant, so
+            // this can never fail in practice — but fail closed via the
+            // normal deny() path rather than a panic, on principle: no
+            // production code path in this component ever panics, even one
+            // that looks provably unreachable today.
+            let token_program_bytes = match decode_pubkey(SPL_TOKEN_PROGRAM_ID) {
+                Ok(b) => b,
+                Err(e) => {
+                    emit(
+                        PluginAction::Fail,
+                        PluginOutcome::Failure,
+                        "internal: SPL_TOKEN_PROGRAM_ID constant failed to decode",
+                    );
+                    return Ok(deny(e));
+                }
+            };
+            let mint_bytes = match decode_pubkey(&req.asset_mint) {
+                Ok(b) => b,
+                Err(e) => {
+                    emit(
+                        PluginAction::Fail,
+                        PluginOutcome::Failure,
+                        "malformed asset_mint",
+                    );
+                    return Ok(deny(e));
+                }
+            };
+
+            // Step 3.5: resolve and verify the real destination token
+            // account before ever signing. Closes a SOL-fee-griefing gap
+            // found during the second audit pass: a server-supplied payTo
+            // that passes the base58/length shape check but isn't actually
+            // an initialized SPL token account would still let us sign a
+            // transaction whose instruction is doomed to fail on-chain —
+            // and Solana can still charge the fee payer (this session key)
+            // the base SOL fee for a submitted-but-failing transaction, a
+            // cost the token-denominated spend caps don't track at all.
+            //
+            // Real x402 servers (confirmed 2026-07-27 against two
+            // independent live deployments — Otto AI mainnet, PayAI Echo
+            // Merchant devnet) publish `payTo` as the recipient's *wallet*
+            // address, not a token account — the payer is expected to
+            // derive the Associated Token Account (ATA) for (wallet, mint)
+            // itself. payTo-as-token-account is tried first (cheapest, no
+            // derivation, no second RPC round trip); a server that instead
+            // already publishes a token account directly keeps working
+            // exactly as before. Only if that fails is payTo treated as a
+            // wallet and its ATA derived and checked — so both real-world
+            // conventions work without knowing in advance which one a
+            // given server uses.
             let account_info = match rpc_call(
                 &rpc_url,
                 "getAccountInfo",
@@ -418,32 +460,118 @@ mod component {
                     )));
                 }
             };
-            if let Err(e) = verify_token_account(&account_info, &req.asset_mint) {
-                emit(
-                    PluginAction::Fail,
-                    PluginOutcome::Failure,
-                    "destination is not a valid token account for the accepted mint",
-                );
-                return Ok(deny(format!(
-                    "refusing to sign: destination failed verification: {e}"
-                )));
-            }
 
-            // SPL_TOKEN_PROGRAM_ID is a fixed, compile-time-known constant, so
-            // this can never fail in practice — but fail closed via the
-            // normal deny() path rather than a panic, on principle: no
-            // production code path in this component ever panics, even one
-            // that looks provably unreachable today.
-            let token_program_bytes = match decode_pubkey(SPL_TOKEN_PROGRAM_ID) {
-                Ok(b) => b,
+            let destination_bytes = if verify_token_account(&account_info, &req.asset_mint).is_ok()
+            {
+                payto_bytes
+            } else {
+                let derived_ata = match derive_associated_token_address(
+                    &payto_bytes,
+                    &token_program_bytes,
+                    &mint_bytes,
+                ) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        emit(
+                            PluginAction::Fail,
+                            PluginOutcome::Failure,
+                            "internal: ATA derivation failed",
+                        );
+                        return Ok(deny(e.to_string()));
+                    }
+                };
+                let derived_ata_b58 = bs58::encode(derived_ata).into_string();
+                let derived_account_info = match rpc_call(
+                    &rpc_url,
+                    "getAccountInfo",
+                    serde_json::json!([derived_ata_b58, {"encoding": "jsonParsed"}]),
+                ) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        emit(
+                            PluginAction::Fail,
+                            PluginOutcome::Failure,
+                            "derived ATA lookup failed",
+                        );
+                        return Ok(deny(format!(
+                            "could not verify derived associated token account, refusing to sign: {e}"
+                        )));
+                    }
+                };
+                if let Err(e) = verify_token_account(&derived_account_info, &req.asset_mint) {
+                    emit(
+                        PluginAction::Fail,
+                        PluginOutcome::Failure,
+                        "payTo is neither a valid token account nor a wallet with an initialized ATA",
+                    );
+                    return Ok(deny(format!(
+                        "refusing to sign: payTo {:?} is not itself a valid token account for the \
+                         accepted mint, and its derived associated token account {derived_ata_b58} \
+                         also failed verification: {e}",
+                        req.pay_to
+                    )));
+                }
+                derived_ata
+            };
+
+            // Step 3.6: resolve the two extra values the real x402 v2
+            // "exact" Solana scheme needs that its own response never
+            // carries: the mint's `decimals` (required for `TransferChecked`,
+            // which validates it on-chain — confirmed absent from every
+            // real 402 response captured this session) and, if the server
+            // sponsors the transaction fee, the address that will pay it
+            // (`extra.feePayer` — confirmed present on live Otto AI and
+            // PayAI responses; `EDITAL.md`: "the facilitator co-signs as
+            // fee payer, so the agent needs no SOL for gas"). Both are
+            // resolved here, before the approval gate, so a malformed mint
+            // or feePayer surfaces on "propose" rather than deep inside
+            // "confirm".
+            let mint_account_info = match rpc_call(
+                &rpc_url,
+                "getAccountInfo",
+                serde_json::json!([req.asset_mint, {"encoding": "jsonParsed"}]),
+            ) {
+                Ok(v) => v,
                 Err(e) => {
                     emit(
                         PluginAction::Fail,
                         PluginOutcome::Failure,
-                        "internal: SPL_TOKEN_PROGRAM_ID constant failed to decode",
+                        "mint account lookup failed",
                     );
-                    return Ok(deny(e));
+                    return Ok(deny(format!(
+                        "could not read the asset mint's decimals, refusing to sign: {e}"
+                    )));
                 }
+            };
+            let mint_decimals = match extract_mint_decimals(&mint_account_info) {
+                Ok(d) => d,
+                Err(e) => {
+                    emit(
+                        PluginAction::Fail,
+                        PluginOutcome::Failure,
+                        "asset_mint is not a parsed SPL mint account",
+                    );
+                    return Ok(deny(format!(
+                        "refusing to sign: could not read decimals for asset_mint {:?}: {e}",
+                        req.asset_mint
+                    )));
+                }
+            };
+            let server_fee_payer_bytes = match req.fee_payer.as_deref() {
+                Some(fp) => match decode_pubkey(fp) {
+                    Ok(b) => Some(b),
+                    Err(e) => {
+                        emit(
+                            PluginAction::Fail,
+                            PluginOutcome::Failure,
+                            "malformed extra.feePayer",
+                        );
+                        return Ok(deny(format!(
+                            "refusing to sign: server's extra.feePayer is malformed: {e}"
+                        )));
+                    }
+                },
+                None => None,
             };
 
             // Approval gate, part 2: everything above (policy, cumulative
@@ -526,7 +654,11 @@ mod component {
             // `[u8; 32]` everywhere it's used below, and is scrubbed on drop
             // no matter which of `execute`'s remaining early-return paths
             // fires after this point — not just the success path.
-            let fee_payer_pubkey = session_key_pubkey(&seed);
+            let authority_pubkey = session_key_pubkey(&seed);
+            // Self-funded fallback when the server sponsors no fee payer:
+            // see transaction.rs's module docs for why this is the same
+            // code path as the sponsored case, not a separate branch.
+            let fee_payer_pubkey = server_fee_payer_bytes.unwrap_or(authority_pubkey);
 
             // Only fetched now, on the confirm path that will actually
             // submit — a blockhash fetched during `propose` would just sit
@@ -543,16 +675,29 @@ mod component {
                 }
             };
 
-            let tx_bytes = build_signed_transaction(
+            let tx_bytes = match build_transfer_checked_transaction(
                 &seed,
+                authority_pubkey,
                 fee_payer_pubkey,
                 source_bytes,
                 destination_bytes,
+                mint_bytes,
                 token_program_bytes,
                 req.amount_atomic,
+                mint_decimals,
                 recent_blockhash,
-            );
-            let payment_header = build_x_payment_header(&tx_bytes, req.network_label());
+            ) {
+                Ok(b) => b,
+                Err(e) => {
+                    emit(
+                        PluginAction::Fail,
+                        PluginOutcome::Failure,
+                        "internal: transaction build failed",
+                    );
+                    return Ok(deny(e));
+                }
+            };
+            let payment_header = build_payment_signature_header(&tx_bytes, &req);
 
             // Step 5: retry the resource with proof of payment.
             let final_resp = match http_get(&parsed.resource_url, Some(&payment_header)) {
@@ -607,7 +752,11 @@ mod component {
         payment_required_header: Option<String>,
     }
 
-    /// `payment_header`, when present, is sent as `X-Payment`. Kept as a
+    /// `payment_header`, when present, is sent as `PAYMENT-SIGNATURE` — the
+    /// x402 v2 header name (confirmed against `@payai/x402`'s client:
+    /// `encodePaymentSignatureHeader` sends `PAYMENT-SIGNATURE` for
+    /// `x402Version: 2` and only falls back to the legacy `X-Payment` name
+    /// for `x402Version: 1`, which this plugin does not build). Kept as a
     /// single named optional parameter rather than a generic header list:
     /// waki's `.header()` requires the header *name* to satisfy
     /// `IntoHeaderName`, which for `&str` is only implemented for
@@ -620,7 +769,7 @@ mod component {
             .get(url)
             .connect_timeout(CONNECT_TIMEOUT);
         if let Some(value) = payment_header {
-            req = req.header("X-Payment", value);
+            req = req.header("PAYMENT-SIGNATURE", value);
         }
         let resp = req
             .send()
@@ -824,12 +973,40 @@ mod component {
             .map_err(|_| format!("{candidate:?} must decode to exactly 32 bytes"))
     }
 
-    fn build_x_payment_header(tx_bytes: &[u8], network: &str) -> String {
-        let payload = serde_json::json!({
-            "x402Version": 1,
+    /// Builds the x402 v2 `PAYMENT-SIGNATURE` payload: base64-encoded JSON
+    /// matching `PaymentPayloadV2Schema` in the reference client
+    /// (`@payai/x402`'s TypeScript source, vendored under
+    /// `x402-echo-merchant/node_modules/@payai/x402`) —
+    /// `{x402Version: 2, accepted, payload, extensions}`.
+    ///
+    /// `accepted.network` echoes the server's original string byte-for-byte
+    /// (`req.network_raw`, never the normalized `network_label()` form) —
+    /// confirmed against `@payai/x402-svm`'s facilitator `verify()`, which
+    /// selects which of the server's own stored requirements to check
+    /// against by comparing `payload.accepted.network` for strict string
+    /// equality; a mismatch here fails lookup before any real check runs.
+    /// Every other field the facilitator actually verifies for correctness
+    /// (mint, destination, amount) it re-derives from decoding the signed
+    /// transaction's own instructions against its own stored requirements —
+    /// not from what this function sends — so `accepted`'s remaining fields
+    /// only need to satisfy the schema, not be independently authoritative.
+    fn build_payment_signature_header(tx_bytes: &[u8], req: &PaymentRequirement) -> String {
+        let mut accepted = serde_json::json!({
             "scheme": "exact",
-            "network": network,
-            "payload": { "serializedTransaction": to_base64(tx_bytes) }
+            "network": req.network_raw,
+            "amount": req.amount_atomic.to_string(),
+            "asset": req.asset_mint,
+            "payTo": req.pay_to,
+            "maxTimeoutSeconds": req.max_timeout_seconds.unwrap_or(DEFAULT_MAX_TIMEOUT_SECONDS),
+        });
+        if let Some(fee_payer) = &req.fee_payer {
+            accepted["extra"] = serde_json::json!({ "feePayer": fee_payer });
+        }
+        let payload = serde_json::json!({
+            "x402Version": 2,
+            "accepted": accepted,
+            "payload": { "transaction": to_base64(tx_bytes) },
+            "extensions": {}
         });
         to_base64(payload.to_string().as_bytes())
     }

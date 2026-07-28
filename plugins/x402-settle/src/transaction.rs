@@ -1,135 +1,130 @@
-//! Manual Solana legacy transaction wire-format serialization — no
-//! `solana-sdk`/`solana-client`, which do not target `wasm32-wasip2`.
+//! Solana transaction assembly using the modular `solana-*` crates (message
+//! compilation, `TransferChecked`, `ComputeBudget`) instead of hand-rolled
+//! byte encoding.
 //!
-//! This is deliberately **not** a general-purpose transaction compiler. It
-//! builds exactly one fixed shape: a single SPL Token `Transfer` instruction,
-//! paid for and authorized by the same session key. Fewer degrees of freedom
-//! here means fewer ways to get account ordering wrong — a genuinely
-//! security-relevant simplification for a T2 component, not a shortcut.
+//! An earlier version of this module hand-encoded a single plain `Transfer`
+//! instruction directly as bytes, reasoning that `solana-sdk` doesn't target
+//! `wasm32-wasip2`. That premise was incomplete: `EDITAL.md` (this bounty's
+//! source of truth) confirms the *modular* crates —
+//! `solana-pubkey`/`solana-instruction`/`solana-message`/`solana-transaction`/
+//! `solana-hash`, plus `spl-token` — compile clean to `wasm32-wasip2` and are
+//! explicitly preferred over hand-rolled encoding. Verified against this
+//! exact plugin's target (2026-07-27) before adopting them here.
 //!
-//! Fixed account order for this shape (Solana requires all signer accounts
-//! before non-signer accounts, writable before read-only within each group):
+//! The instruction shape itself also had to change to match what real x402
+//! v2 Solana servers actually require (confirmed against the x402.org
+//! public facilitator and `docs.payai.network/x402/clients/typescript/
+//! manual-flow.md`, "Solana exact scheme"), in this exact order:
+//! 1. `SetComputeUnitLimit` (<=40,000 compute units)
+//! 2. `SetComputeUnitPrice` (<=5 microlamports/CU)
+//! 3. `TransferChecked` (validates mint + decimals, unlike plain `Transfer`)
 //!
-//! 1. `fee_payer` / transfer authority — signer, writable (index 0; the fee
-//!    payer must be both signer and writable, since transaction fees debit
-//!    its lamport balance)
-//! 2. `source_token_account` — writable, non-signer
-//! 3. `destination_token_account` — writable, non-signer
-//! 4. SPL Token program ID — read-only, non-signer
+//! ## Two fee-payer models, one code path
 //!
-//! Message header is therefore always `(num_required_signatures: 1,
-//! num_readonly_signed_accounts: 0, num_readonly_unsigned_accounts: 1)`.
+//! `EDITAL.md`: *"the facilitator co-signs as fee payer, so the agent needs
+//! no SOL for gas"* — the standard x402 v2 pattern, confirmed live: every
+//! real server tested this session (Otto AI, PayAI, x402.org) advertises an
+//! `extra.feePayer`. `fee_payer_pubkey` carries that address when present.
+//!
+//! When the server provides no `feePayer`, the caller passes the session
+//! key's own pubkey as `fee_payer_pubkey` — identical to `authority_pubkey`.
+//! `Message::new_with_blockhash`'s key deduplication then naturally collapses
+//! this to a single required signer, so the self-funded model (the original
+//! behavior) falls out of the *same* code path rather than a separate one:
+//! fewer branches to get wrong in a T2 component.
+//!
+//! In the sponsored case, the transaction is deliberately left **partially
+//! signed**: the fee payer's signature slot (always account index 0 — an
+//! ordering `Message::new_with_blockhash` guarantees, verified in this
+//! module's tests) stays the default/zeroed placeholder. This plugin signs
+//! only its own slot, as the transfer authority — never the fee payer's.
+//! Only the facilitator can complete and broadcast it.
 
-use crate::x402_settle::{sign_message, SPL_TOKEN_TRANSFER_TAG};
+use solana_compute_budget_interface::ComputeBudgetInstruction;
+use solana_hash::Hash;
+use solana_message::Message;
+use solana_pubkey::Pubkey;
+use solana_signature::Signature;
+use solana_transaction::Transaction;
 
-/// Solana's "compact-u16" / shortvec length prefix: 7 bits per byte, MSB set
-/// on every byte except the last. Every array length in this fixed shape
-/// (1 signature, 4 account keys, 1 instruction, 3 instruction-account
-/// indices, 9 bytes of instruction data) fits in a single byte, but the
-/// encoder is written generally and tested at the multi-byte boundaries so
-/// it is not just "happens to work for small numbers".
-pub fn encode_shortvec_len(mut len: usize) -> Vec<u8> {
-    let mut out = Vec::new();
-    loop {
-        let mut byte = (len & 0x7f) as u8;
-        len >>= 7;
-        if len != 0 {
-            byte |= 0x80;
-            out.push(byte);
-        } else {
-            out.push(byte);
-            break;
-        }
-    }
-    out
-}
+use crate::x402_settle::sign_message;
 
-/// Serialize the legacy `Message` (everything the signature covers) for the
-/// fixed transfer shape described above. Returns the message bytes alone —
-/// callers sign these bytes, then prepend the compact-array of signatures to
-/// get the final transaction.
-pub fn compile_transfer_message(
-    fee_payer: [u8; 32],
-    source_token_account: [u8; 32],
-    destination_token_account: [u8; 32],
-    token_program_id: [u8; 32],
-    amount_atomic: u64,
-    recent_blockhash: [u8; 32],
-) -> Vec<u8> {
-    let mut msg = Vec::new();
+/// Compute unit ceiling the spec allows for this instruction shape.
+pub const COMPUTE_UNIT_LIMIT: u32 = 40_000;
+/// Priority-fee ceiling the spec allows, in microlamports per compute unit.
+pub const COMPUTE_UNIT_PRICE_MICROLAMPORTS: u64 = 5;
 
-    // Message header.
-    msg.push(1u8); // num_required_signatures
-    msg.push(0u8); // num_readonly_signed_accounts
-    msg.push(1u8); // num_readonly_unsigned_accounts
-
-    // Account keys, compact array. Fixed order — see module docs.
-    let account_keys = [
-        fee_payer,
-        source_token_account,
-        destination_token_account,
-        token_program_id,
-    ];
-    msg.extend_from_slice(&encode_shortvec_len(account_keys.len()));
-    for key in &account_keys {
-        msg.extend_from_slice(key);
-    }
-
-    // Recent blockhash.
-    msg.extend_from_slice(&recent_blockhash);
-
-    // Instructions, compact array — exactly one: the SPL Token Transfer.
-    msg.extend_from_slice(&encode_shortvec_len(1));
-    // program_id_index: index 3 in account_keys (the token program).
-    msg.push(3u8);
-    // account indices referenced by this instruction, in the order the SPL
-    // Token program expects for Transfer: [source, destination, owner].
-    let instruction_accounts: [u8; 3] = [1, 2, 0];
-    msg.extend_from_slice(&encode_shortvec_len(instruction_accounts.len()));
-    msg.extend_from_slice(&instruction_accounts);
-    // instruction data: tag (3 = Transfer) + amount as u64 little-endian.
-    let mut data = Vec::with_capacity(9);
-    data.push(SPL_TOKEN_TRANSFER_TAG);
-    data.extend_from_slice(&amount_atomic.to_le_bytes());
-    msg.extend_from_slice(&encode_shortvec_len(data.len()));
-    msg.extend_from_slice(&data);
-
-    msg
-}
-
-/// Compile the message, sign it with the session key, and assemble the final
-/// transaction wire bytes: compact-array-of-signatures followed by the
-/// message. `fee_payer_seed` is the session key's 32-byte ed25519 seed —
-/// the fee payer, transfer authority, and signer are always this same key
-/// in this fixed shape; there is no code path for a different signer.
-pub fn build_signed_transaction(
-    fee_payer_seed: &[u8; 32],
+/// Builds the full instruction set, compiles the message, signs only this
+/// plugin's own signer slot (transfer authority — never the fee payer's, if
+/// they differ), and returns the serialized transaction wire bytes.
+///
+/// `fee_payer_pubkey` may equal `authority_pubkey` (self-funded fallback) or
+/// name a different address (server-sponsored — see module docs); either
+/// way this is the only transaction-building path in the plugin.
+#[allow(clippy::too_many_arguments)]
+pub fn build_transfer_checked_transaction(
+    authority_seed: &[u8; 32],
+    authority_pubkey: [u8; 32],
     fee_payer_pubkey: [u8; 32],
     source_token_account: [u8; 32],
     destination_token_account: [u8; 32],
+    mint: [u8; 32],
     token_program_id: [u8; 32],
     amount_atomic: u64,
+    decimals: u8,
     recent_blockhash: [u8; 32],
-) -> Vec<u8> {
-    let message = compile_transfer_message(
-        fee_payer_pubkey,
-        source_token_account,
-        destination_token_account,
-        token_program_id,
-        amount_atomic,
-        recent_blockhash,
-    );
-    let signature = sign_message(fee_payer_seed, &message);
+) -> Result<Vec<u8>, String> {
+    let token_program = Pubkey::new_from_array(token_program_id);
+    let source = Pubkey::new_from_array(source_token_account);
+    let mint_key = Pubkey::new_from_array(mint);
+    let destination = Pubkey::new_from_array(destination_token_account);
+    let authority = Pubkey::new_from_array(authority_pubkey);
+    let fee_payer = Pubkey::new_from_array(fee_payer_pubkey);
 
-    let mut tx = Vec::with_capacity(1 + 64 + message.len());
-    tx.extend_from_slice(&encode_shortvec_len(1)); // one signature
-    tx.extend_from_slice(&signature);
-    tx.extend_from_slice(&message);
-    tx
+    let ix_limit = ComputeBudgetInstruction::set_compute_unit_limit(COMPUTE_UNIT_LIMIT);
+    let ix_price =
+        ComputeBudgetInstruction::set_compute_unit_price(COMPUTE_UNIT_PRICE_MICROLAMPORTS);
+    let ix_transfer = spl_token::instruction::transfer_checked(
+        &token_program,
+        &source,
+        &mint_key,
+        &destination,
+        &authority,
+        &[],
+        amount_atomic,
+        decimals,
+    )
+    .map_err(|e| format!("failed to build transfer_checked instruction: {e}"))?;
+
+    let instructions = [ix_limit, ix_price, ix_transfer];
+    let blockhash = Hash::new_from_array(recent_blockhash);
+    let message = Message::new_with_blockhash(&instructions, Some(&fee_payer), &blockhash);
+
+    // Never assume a fixed index for our own signer slot: when fee_payer
+    // and authority are the same key (self-funded fallback), the *only*
+    // slot is index 0; when they differ, ours is whichever index the
+    // message compiler placed it at (index 1 in every case observed so
+    // far, but this must never be hardcoded — see the sponsored-model test
+    // below for what would happen if it silently weren't).
+    let num_signers = message.header.num_required_signatures as usize;
+    let our_index = message.account_keys[..num_signers]
+        .iter()
+        .position(|k| k.as_ref() == authority_pubkey.as_slice())
+        .ok_or_else(|| {
+            "internal: our authority key is not among the required signers".to_string()
+        })?;
+
+    let mut tx = Transaction::new_unsigned(message);
+    let message_bytes = bincode::serialize(&tx.message)
+        .map_err(|e| format!("internal: message serialize failed: {e}"))?;
+    let sig_bytes = sign_message(authority_seed, &message_bytes);
+    tx.signatures[our_index] = Signature::from(sig_bytes);
+
+    bincode::serialize(&tx).map_err(|e| format!("internal: transaction serialize failed: {e}"))
 }
 
-/// Base64-encode the final transaction bytes for the x402 `X-Payment`
-/// payload's `serializedTransaction` field.
+/// Base64-encode the final transaction bytes for the x402 `PAYMENT-SIGNATURE`
+/// payload's `transaction` field.
 pub fn to_base64(bytes: &[u8]) -> String {
     use base64::Engine;
     base64::engine::general_purpose::STANDARD.encode(bytes)
@@ -138,32 +133,19 @@ pub fn to_base64(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::x402_settle::session_key_pubkey;
+    use crate::x402_settle::{session_key_pubkey, SPL_TOKEN_PROGRAM_ID};
+    use solana_signature::Signature as SolSignature;
 
-    #[test]
-    fn shortvec_encodes_single_byte_values() {
-        assert_eq!(encode_shortvec_len(0), vec![0x00]);
-        assert_eq!(encode_shortvec_len(1), vec![0x01]);
-        assert_eq!(encode_shortvec_len(127), vec![0x7f]);
-    }
-
-    #[test]
-    fn shortvec_encodes_two_byte_boundary() {
-        // 128 = 0b1000_0000 -> low 7 bits = 0, continuation set, then 1.
-        assert_eq!(encode_shortvec_len(128), vec![0x80, 0x01]);
-        assert_eq!(encode_shortvec_len(16383), vec![0xff, 0x7f]);
-    }
-
-    #[test]
-    fn shortvec_encodes_three_byte_boundary() {
-        assert_eq!(encode_shortvec_len(16384), vec![0x80, 0x80, 0x01]);
+    fn pk(base58: &str) -> [u8; 32] {
+        crate::x402_settle::decode_pubkey("test", base58).expect("valid test pubkey")
     }
 
     struct FixedAccounts {
         seed: [u8; 32],
-        fee_payer: [u8; 32],
+        authority: [u8; 32],
         source: [u8; 32],
         destination: [u8; 32],
+        mint: [u8; 32],
         program_id: [u8; 32],
     }
 
@@ -171,130 +153,156 @@ mod tests {
         let seed = [11u8; 32];
         FixedAccounts {
             seed,
-            fee_payer: session_key_pubkey(&seed),
+            authority: session_key_pubkey(&seed),
             source: [1u8; 32],
             destination: [2u8; 32],
-            program_id: [3u8; 32],
+            mint: [5u8; 32],
+            program_id: pk(SPL_TOKEN_PROGRAM_ID),
         }
     }
 
+    fn decode_tx(bytes: &[u8]) -> Transaction {
+        bincode::deserialize(bytes).expect("must decode as a Transaction")
+    }
+
     #[test]
-    fn compiled_message_has_correct_header_and_account_order() {
+    fn self_funded_fallback_collapses_to_a_single_fully_signed_transaction() {
         let a = fixed_accounts();
         let blockhash = [4u8; 32];
-        let msg = compile_transfer_message(
-            a.fee_payer,
+        let tx_bytes = build_transfer_checked_transaction(
+            &a.seed,
+            a.authority,
+            a.authority, // no server-provided fee payer: same key
             a.source,
             a.destination,
+            a.mint,
             a.program_id,
             1_000_000,
+            6,
             blockhash,
-        );
+        )
+        .expect("build must succeed");
 
+        let tx = decode_tx(&tx_bytes);
         assert_eq!(
-            &msg[0..3],
-            &[1, 0, 1],
-            "header: 1 required sig, 0 readonly-signed, 1 readonly-unsigned"
+            tx.message.header.num_required_signatures, 1,
+            "same fee payer and authority must dedup to one signer"
         );
-        assert_eq!(msg[3], 4, "compact array len for 4 account keys");
-        assert_eq!(&msg[4..36], &a.fee_payer, "account 0 must be the fee payer");
-        assert_eq!(
-            &msg[36..68],
-            &a.source,
-            "account 1 must be the source token account"
-        );
-        assert_eq!(
-            &msg[68..100],
-            &a.destination,
-            "account 2 must be the destination token account"
-        );
-        assert_eq!(
-            &msg[100..132],
-            &a.program_id,
-            "account 3 must be the token program"
-        );
-        assert_eq!(
-            &msg[132..164],
-            &blockhash,
-            "recent blockhash follows the account keys"
+        assert_ne!(
+            tx.signatures[0],
+            SolSignature::default(),
+            "the single slot must be signed"
         );
     }
 
     #[test]
-    fn compiled_message_instruction_references_correct_indices_and_data() {
+    fn sponsored_fee_payer_is_account_zero_and_stays_unsigned_by_us() {
         let a = fixed_accounts();
+        let fee_payer = [99u8; 32]; // a different key: the "facilitator"
         let blockhash = [4u8; 32];
-        let msg = compile_transfer_message(
-            a.fee_payer,
+        let tx_bytes = build_transfer_checked_transaction(
+            &a.seed,
+            a.authority,
+            fee_payer,
             a.source,
             a.destination,
+            a.mint,
+            a.program_id,
+            1_000_000,
+            6,
+            blockhash,
+        )
+        .expect("build must succeed");
+
+        let tx = decode_tx(&tx_bytes);
+        assert_eq!(tx.message.header.num_required_signatures, 2);
+        assert_eq!(
+            tx.message.account_keys[0].as_ref(),
+            fee_payer.as_slice(),
+            "fee payer must be account index 0"
+        );
+        assert_eq!(
+            tx.signatures[0],
+            SolSignature::default(),
+            "fee payer's slot must stay unsigned — only the facilitator may fill it in"
+        );
+        let our_index = tx.message.account_keys[..2]
+            .iter()
+            .position(|k| k.as_ref() == a.authority.as_slice())
+            .expect("our authority must be among the required signers");
+        assert_ne!(our_index, 0, "we must never occupy the fee payer's slot");
+        assert_ne!(
+            tx.signatures[our_index],
+            SolSignature::default(),
+            "our own slot must be signed"
+        );
+    }
+
+    #[test]
+    fn instructions_are_compute_budget_then_transfer_checked_in_order() {
+        let a = fixed_accounts();
+        let tx_bytes = build_transfer_checked_transaction(
+            &a.seed,
+            a.authority,
+            a.authority,
+            a.source,
+            a.destination,
+            a.mint,
             a.program_id,
             42,
-            blockhash,
-        );
+            6,
+            [4u8; 32],
+        )
+        .expect("build must succeed");
 
-        // offset 164: compact array len of instructions (1)
-        let mut i = 164;
-        assert_eq!(msg[i], 1, "exactly one instruction");
-        i += 1;
-        assert_eq!(msg[i], 3, "program_id_index must point at account index 3");
-        i += 1;
-        assert_eq!(msg[i], 3, "instruction references exactly 3 accounts");
-        i += 1;
+        let tx = decode_tx(&tx_bytes);
         assert_eq!(
-            &msg[i..i + 3],
-            &[1, 2, 0],
-            "account indices: source, destination, owner"
+            tx.message.instructions.len(),
+            3,
+            "compute limit + price + transfer"
         );
-        i += 3;
-        assert_eq!(msg[i], 9, "instruction data is 9 bytes");
-        i += 1;
-        assert_eq!(msg[i], SPL_TOKEN_TRANSFER_TAG);
-        assert_eq!(&msg[i + 1..i + 9], &42u64.to_le_bytes());
-        assert_eq!(
-            msg.len(),
-            i + 9,
-            "no trailing bytes beyond the instruction data"
-        );
+        let compute_budget_program = "ComputeBudget111111111111111111111111111111";
+        let program_at = |ix_index: usize| {
+            let program_index = tx.message.instructions[ix_index].program_id_index as usize;
+            tx.message.account_keys[program_index].to_string()
+        };
+        assert_eq!(program_at(0), compute_budget_program);
+        assert_eq!(program_at(1), compute_budget_program);
+        assert_eq!(program_at(2), SPL_TOKEN_PROGRAM_ID);
     }
 
     #[test]
-    fn signed_transaction_signature_verifies_against_the_message_bytes() {
-        use ed25519_dalek::{Verifier, VerifyingKey};
-
+    fn signature_does_not_verify_against_a_tampered_message() {
         let a = fixed_accounts();
-        let blockhash = [7u8; 32];
-        let tx = build_signed_transaction(
+        let tx_bytes = build_transfer_checked_transaction(
             &a.seed,
-            a.fee_payer,
+            a.authority,
+            a.authority,
             a.source,
             a.destination,
+            a.mint,
             a.program_id,
-            500_000,
-            blockhash,
+            1_000_000,
+            6,
+            [4u8; 32],
+        )
+        .expect("build must succeed");
+        let mut tampered = decode_tx(&tx_bytes);
+        // Flip the amount encoded in the TransferChecked instruction data.
+        let last_ix = tampered.message.instructions.last_mut().unwrap();
+        let last_byte = last_ix.data.len() - 1;
+        last_ix.data[last_byte] ^= 0xFF;
+
+        use ed25519_dalek::{Verifier, VerifyingKey};
+        let verifying_key = VerifyingKey::from_bytes(&a.authority).unwrap();
+        let tampered_message_bytes = bincode::serialize(&tampered.message).unwrap();
+        let sig = ed25519_dalek::Signature::from_bytes(
+            tampered.signatures[0].as_ref().try_into().unwrap(),
         );
-
-        // tx = [sig_count_prefix(1 byte for count=1)] [64-byte signature] [message...]
-        assert_eq!(tx[0], 1, "compact array len prefix for one signature");
-        let signature_bytes: [u8; 64] = tx[1..65].try_into().unwrap();
-        let message_bytes = &tx[65..];
-
-        let expected_message = compile_transfer_message(
-            a.fee_payer,
-            a.source,
-            a.destination,
-            a.program_id,
-            500_000,
-            blockhash,
+        assert!(
+            verifying_key.verify(&tampered_message_bytes, &sig).is_err(),
+            "signature must not verify once the message bytes are tampered with"
         );
-        assert_eq!(message_bytes, expected_message.as_slice());
-
-        let verifying_key = VerifyingKey::from_bytes(&a.fee_payer)
-            .expect("fee payer must be a valid ed25519 point");
-        let signature = ed25519_dalek::Signature::from_bytes(&signature_bytes);
-        verifying_key
-            .verify(message_bytes, &signature)
-            .expect("signature must verify against the exact message bytes it signed");
     }
 
     #[test]

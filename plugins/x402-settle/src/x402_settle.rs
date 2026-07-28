@@ -33,8 +33,6 @@ pub const CUMULATIVE_WINDOW_SECONDS: i64 = 24 * 60 * 60;
 
 /// The SPL Token program ID (mainnet and devnet share this address).
 pub const SPL_TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
-/// Instruction tag for `spl_token::instruction::TokenInstruction::Transfer`.
-pub(crate) const SPL_TOKEN_TRANSFER_TAG: u8 = 3;
 
 // ---------------------------------------------------------------------------
 // Requirement parsing and policy validation (duplicated from x402-quote-check)
@@ -107,10 +105,28 @@ impl SolanaCluster {
 #[derive(Debug, Clone, PartialEq)]
 pub struct PaymentRequirement {
     pub network: SolanaCluster,
+    /// The network identifier exactly as the server sent it (e.g. the
+    /// CAIP-2 `solana:<truncated-genesis-hash>` form), kept verbatim
+    /// alongside the parsed `network` enum specifically so the reply
+    /// envelope's `accepted.network` can echo it byte-for-byte. Confirmed
+    /// against the real x402 facilitator (`@payai/x402-svm`'s `verify()`)
+    /// that this field is compared with strict string equality against the
+    /// server's own record to select which `accepts[]` entry a payment is
+    /// for — echoing `network_label()`'s normalized form instead would
+    /// mismatch a CAIP-2 string and fail that lookup.
+    pub network_raw: String,
     pub asset_mint: String,
     pub amount_atomic: u64,
     pub pay_to: String,
     pub max_timeout_seconds: Option<u64>,
+    /// `extra.feePayer` from the server's `accepts[]` entry, when present.
+    /// Real x402 v2 Solana servers (confirmed against x402.org's public
+    /// facilitator, 2026-07-27) sponsor the transaction fee via this
+    /// address — `EDITAL.md`: "the facilitator co-signs as fee payer, so
+    /// the agent needs no SOL for gas." `None` falls back to the session
+    /// key paying its own fee (see `transaction::build_transfer_checked_transaction`'s
+    /// module docs for how both models share one code path).
+    pub fee_payer: Option<String>,
     pub source_shape: &'static str,
 }
 
@@ -214,6 +230,11 @@ fn looks_like_solana_network(raw: &str) -> bool {
 
 fn parse_v2_accepts_shape(raw_json: &str) -> Result<PaymentRequirement, String> {
     #[derive(serde::Deserialize)]
+    struct Extra {
+        #[serde(rename = "feePayer")]
+        fee_payer: Option<String>,
+    }
+    #[derive(serde::Deserialize)]
     struct Accept {
         network: String,
         asset: String,
@@ -222,6 +243,8 @@ fn parse_v2_accepts_shape(raw_json: &str) -> Result<PaymentRequirement, String> 
         #[serde(rename = "maxTimeoutSeconds")]
         max_timeout_seconds: Option<u64>,
         amount: AmountField,
+        #[serde(default)]
+        extra: Option<Extra>,
     }
     #[derive(serde::Deserialize)]
     struct V2Response {
@@ -252,13 +275,17 @@ fn parse_v2_accepts_shape(raw_json: &str) -> Result<PaymentRequirement, String> 
         .nth(chosen_index)
         .ok_or_else(|| "internal: chosen accepts[] index out of bounds".to_string())?;
     let amount_atomic = chosen.amount.into_u64()?;
+    let network_raw = chosen.network.clone();
+    let fee_payer = chosen.extra.and_then(|e| e.fee_payer);
 
     Ok(PaymentRequirement {
         network: SolanaCluster::parse(&chosen.network),
+        network_raw,
         asset_mint: chosen.asset,
         amount_atomic,
         pay_to: chosen.pay_to,
         max_timeout_seconds: chosen.max_timeout_seconds,
+        fee_payer,
         source_shape: "x402-spec-v2-accepts",
     })
 }
@@ -279,13 +306,19 @@ fn parse_solana_foundation_flat_shape(raw_json: &str) -> Result<PaymentRequireme
 
     let parsed: FlatResponse = serde_json::from_str(raw_json).map_err(|e| e.to_string())?;
     let amount_atomic = parsed.payment.amount.into_u64()?;
+    let network_raw = parsed.payment.cluster.clone();
 
     Ok(PaymentRequirement {
         network: SolanaCluster::parse(&parsed.payment.cluster),
+        network_raw,
         asset_mint: parsed.payment.mint,
         amount_atomic,
         pay_to: parsed.payment.recipient_wallet,
         max_timeout_seconds: None,
+        // This flat, tutorial-only shape has no fee-sponsorship concept —
+        // confirmed absent from the Solana Foundation's own example
+        // responses; a client paying against this shape always self-funds.
+        fee_payer: None,
         source_shape: "solana-foundation-flat",
     })
 }
@@ -516,22 +549,12 @@ pub fn check_cumulative_cap(
 }
 
 // ---------------------------------------------------------------------------
-// SPL Token `Transfer` instruction — manual byte layout, no solana-sdk
+// SPL Token instruction building now lives in transaction.rs, using the
+// modular solana-*/spl-token crates (TransferChecked, not the plain
+// Transfer this section used to hand-encode) — see that module's docs for
+// why. `BuildInstructionError` and `decode_pubkey` below are still used by
+// `associated_token.rs` and the account-verification path.
 // ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AccountMeta {
-    pub pubkey: [u8; 32],
-    pub is_signer: bool,
-    pub is_writable: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InstructionPlan {
-    pub program_id: [u8; 32],
-    pub accounts: Vec<AccountMeta>,
-    pub data: Vec<u8>,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BuildInstructionError {
@@ -551,7 +574,10 @@ impl std::fmt::Display for BuildInstructionError {
     }
 }
 
-fn decode_pubkey(field: &'static str, candidate: &str) -> Result<[u8; 32], BuildInstructionError> {
+pub fn decode_pubkey(
+    field: &'static str,
+    candidate: &str,
+) -> Result<[u8; 32], BuildInstructionError> {
     // See MAX_BASE58_PUBKEY_INPUT_LEN's doc comment: bs58::decode is O(n^2)
     // in input length, and `destination_token_account` here is ultimately
     // sourced from an untrusted server's payTo field. Reject oversized input
@@ -580,50 +606,6 @@ fn decode_pubkey(field: &'static str, candidate: &str) -> Result<[u8; 32], Build
             field,
             value: candidate.to_string(),
         })
-}
-
-/// Build an SPL Token `Transfer` instruction (tag `3`): moves `amount_atomic`
-/// from `source_token_account` to `destination_token_account`, authorized by
-/// `owner` (the session key's public key). This is an **inbound-only**
-/// primitive by construction: there is no code path here for `Withdraw`,
-/// `Burn`, or any instruction shape other than a plain transfer out of the
-/// account this plugin itself controls.
-pub fn build_transfer_instruction(
-    source_token_account: &str,
-    destination_token_account: &str,
-    owner: &str,
-    amount_atomic: u64,
-) -> Result<InstructionPlan, BuildInstructionError> {
-    let program_id = decode_pubkey("spl_token_program", SPL_TOKEN_PROGRAM_ID)?;
-    let source = decode_pubkey("source_token_account", source_token_account)?;
-    let destination = decode_pubkey("destination_token_account", destination_token_account)?;
-    let owner_key = decode_pubkey("owner", owner)?;
-
-    let mut data = Vec::with_capacity(9);
-    data.push(SPL_TOKEN_TRANSFER_TAG);
-    data.extend_from_slice(&amount_atomic.to_le_bytes());
-
-    Ok(InstructionPlan {
-        program_id,
-        accounts: vec![
-            AccountMeta {
-                pubkey: source,
-                is_signer: false,
-                is_writable: true,
-            },
-            AccountMeta {
-                pubkey: destination,
-                is_signer: false,
-                is_writable: true,
-            },
-            AccountMeta {
-                pubkey: owner_key,
-                is_signer: true,
-                is_writable: false,
-            },
-        ],
-        data,
-    })
 }
 
 // ---------------------------------------------------------------------------
@@ -741,12 +723,17 @@ pub fn build_approval_token(
     expires_at_slot: u64,
 ) -> String {
     format!(
-        "v1:{}:{}:{}:{}:{}:{}",
+        "v1:{}:{}:{}:{}:{}:{}:{}",
         req.network_label(),
         req.asset_mint,
         req.pay_to,
         req.amount_atomic,
         source_token_account,
+        // Bound into the token so a server can't change who gets sponsored
+        // between "propose" (what a human approves) and "confirm" (what
+        // actually gets signed) without invalidating the approval — the
+        // same reasoning that already binds mint/pay_to/amount above.
+        req.fee_payer.as_deref().unwrap_or("none"),
         expires_at_slot
     )
 }
@@ -913,10 +900,12 @@ mod tests {
         let cfg = default_policy();
         let req = PaymentRequirement {
             network: SolanaCluster::Mainnet,
+            network_raw: "solana-mainnet".to_string(),
             asset_mint: DEFAULT_MAINNET_USDC_MINT.to_string(),
             amount_atomic: 1_000_000,
             pay_to: VALID_PAYTO.to_string(),
             max_timeout_seconds: Some(30),
+            fee_payer: None,
             source_shape: "test",
         };
         assert!(matches!(
@@ -930,10 +919,12 @@ mod tests {
         let cfg = default_policy();
         let req = PaymentRequirement {
             network: SolanaCluster::Mainnet,
+            network_raw: "solana-mainnet".to_string(),
             asset_mint: "NotTheRealMint".to_string(),
             amount_atomic: 1,
             pay_to: VALID_PAYTO.to_string(),
             max_timeout_seconds: None,
+            fee_payer: None,
             source_shape: "test",
         };
         match validate_requirements(&req, &cfg) {
@@ -1034,42 +1025,14 @@ mod tests {
         }
     }
 
-    // ---- instruction building ----
+    // ---- decode_pubkey: shared by associated_token.rs and the account-
+    // verification path — instruction building itself now lives in
+    // transaction.rs via spl-token's own (tested upstream) instruction
+    // builder, see that module's tests instead.
 
     #[test]
-    fn build_transfer_instruction_has_correct_tag_and_amount_layout() {
-        let plan = build_transfer_instruction(
-            VALID_SOURCE_TOKEN_ACCOUNT,
-            VALID_PAYTO,
-            VALID_OWNER,
-            1_000_000,
-        )
-        .expect("valid pubkeys must build");
-        assert_eq!(plan.data[0], SPL_TOKEN_TRANSFER_TAG);
-        assert_eq!(&plan.data[1..9], &1_000_000u64.to_le_bytes());
-        assert_eq!(plan.data.len(), 9);
-    }
-
-    #[test]
-    fn build_transfer_instruction_account_metas_are_source_dest_owner_signer_only() {
-        let plan =
-            build_transfer_instruction(VALID_SOURCE_TOKEN_ACCOUNT, VALID_PAYTO, VALID_OWNER, 1)
-                .unwrap();
-        assert_eq!(plan.accounts.len(), 3);
-        assert!(plan.accounts[0].is_writable && !plan.accounts[0].is_signer);
-        assert!(plan.accounts[1].is_writable && !plan.accounts[1].is_signer);
-        assert!(plan.accounts[2].is_signer && !plan.accounts[2].is_writable);
-    }
-
-    #[test]
-    fn build_transfer_instruction_rejects_malformed_destination() {
-        let err = build_transfer_instruction(
-            VALID_SOURCE_TOKEN_ACCOUNT,
-            "not-base58-!!!",
-            VALID_OWNER,
-            1,
-        )
-        .unwrap_err();
+    fn decode_pubkey_rejects_malformed_input() {
+        let err = decode_pubkey("destination_token_account", "not-base58-!!!").unwrap_err();
         assert!(matches!(
             err,
             BuildInstructionError::InvalidPubkey {
@@ -1080,9 +1043,9 @@ mod tests {
     }
 
     #[test]
-    fn build_transfer_instruction_rejects_wrong_length_pubkey() {
+    fn decode_pubkey_rejects_wrong_length_pubkey() {
         let short = bs58::encode([1u8, 2, 3]).into_string();
-        let err = build_transfer_instruction(&short, VALID_PAYTO, VALID_OWNER, 1).unwrap_err();
+        let err = decode_pubkey("source_token_account", &short).unwrap_err();
         assert!(matches!(
             err,
             BuildInstructionError::InvalidPubkey {
@@ -1231,10 +1194,12 @@ mod tests {
     fn sample_req() -> PaymentRequirement {
         PaymentRequirement {
             network: SolanaCluster::Mainnet,
+            network_raw: "solana-mainnet".to_string(),
             asset_mint: DEFAULT_MAINNET_USDC_MINT.to_string(),
             amount_atomic: 1_000_000,
             pay_to: VALID_PAYTO.to_string(),
             max_timeout_seconds: Some(30),
+            fee_payer: None,
             source_shape: "test",
         }
     }
@@ -1300,6 +1265,28 @@ mod tests {
             ),
             Err(ApprovalError::Mismatch),
             "a token issued for one recipient must not confirm a payment to a different one"
+        );
+    }
+
+    #[test]
+    fn approval_token_rejects_a_different_fee_payer_than_it_was_issued_for() {
+        // A malicious or compromised server changing which address gets
+        // sponsored between "propose" (what a human reads and approves) and
+        // "confirm" (what actually gets signed) must invalidate the token —
+        // the same protection already proven above for amount and payTo.
+        let req = sample_req();
+        let token = build_approval_token(&req, VALID_SOURCE_TOKEN_ACCOUNT, 1_000_200);
+        let mut responsored_req = req.clone();
+        responsored_req.fee_payer = Some(VALID_OWNER.to_string());
+        assert_eq!(
+            verify_approval_token(
+                &token,
+                &responsored_req,
+                VALID_SOURCE_TOKEN_ACCOUNT,
+                1_000_100
+            ),
+            Err(ApprovalError::Mismatch),
+            "a token issued for one fee payer must not confirm a payment sponsored by a different one"
         );
     }
 

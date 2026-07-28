@@ -5,7 +5,7 @@ author = "ZeroClaw Labs"
 wasm_path = "x402_settle.wasm"
 capabilities = ["tool"]
 # http_client: fetch the 402 challenge, fetch the session account's recent
-# transfer history (for the cumulative cap), and retry with X-Payment.
+# transfer history (for the cumulative cap), and retry with PAYMENT-SIGNATURE.
 # config_read: the host injects this plugin's own config section (policy
 # thresholds and the session key material) as `__config`.
 permissions = ["http_client", "config_read"]

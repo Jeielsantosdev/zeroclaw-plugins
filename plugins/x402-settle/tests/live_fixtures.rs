@@ -54,6 +54,25 @@ fn real_otto_ai_header_parses_and_selects_the_solana_leg_not_the_first_evm_one()
 }
 
 #[test]
+fn real_otto_ai_solana_leg_carries_a_real_facilitator_fee_payer_and_raw_network() {
+    // This real, live-captured Otto AI response's Solana leg has an
+    // `extra.feePayer` — confirming the facilitator-sponsorship model
+    // (`EDITAL.md`: "the facilitator co-signs as fee payer") against a real
+    // server, not just the PayAI reference client's source code. `network`
+    // must also survive verbatim (the CAIP-2 string, not the normalized
+    // "solana-mainnet" label) for `accepted.network` to round-trip
+    // correctly in the reply envelope — see `PaymentRequirement::network_raw`'s
+    // doc comment for why the normalized label is unsafe to echo back.
+    let req = parse_requirements_from_response(Some(OTTO_HEADER.trim()), OTTO_BODY.trim())
+        .expect("header path should parse the real Otto AI 402");
+    assert_eq!(
+        req.fee_payer.as_deref(),
+        Some("GVJJ7rdGiXr5xaYbRwRbjfaJL7fmwRygFi1H6aGqDveb")
+    );
+    assert_eq!(req.network_raw, "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp");
+}
+
+#[test]
 fn real_otto_ai_solana_leg_genesis_hash_is_caip2_truncated_by_spec_not_malformed() {
     // The CAIP-2 Solana namespace spec (ChainAgnostic/namespaces,
     // solana/caip2.md) mandates `truncate(genesisHash, 32)` as the chain

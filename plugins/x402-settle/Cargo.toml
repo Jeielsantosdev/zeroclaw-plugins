@@ -25,6 +25,32 @@ ed25519-dalek = { version = "2", default-features = false, features = ["fast", "
 zeroize = "1"
 # alloc-only: no std-only extras needed to base64-encode the signed transaction.
 base64 = { version = "0.22", default-features = false, features = ["alloc"] }
+# Already resolved transitively via ed25519-dalek (same versions pinned in
+# Cargo.lock); declared directly here too because associated_token.rs uses
+# both for real Associated Token Account (PDA) derivation, not just signing.
+curve25519-dalek = { version = "4.1", default-features = false }
+sha2 = { version = "0.10", default-features = false }
+# Modular Solana crates — confirmed (2026-07-27) to compile clean to
+# wasm32-wasip2, and explicitly preferred by EDITAL.md over hand-rolled byte
+# encoding ("no hand-rolled byte encoding needed to build and serialize
+# transactions... prefer the modular crates"). Used for correct message
+# compilation (account ordering, dedup) and the exact instruction shapes
+# (ComputeBudget, TransferChecked) real x402 v2 Solana servers require — see
+# transaction.rs.
+solana-pubkey = "3.0.0"
+solana-instruction = "3.5.0"
+solana-message = { version = "4.4.0", features = ["serde"] }
+solana-transaction = { version = "4.1.5", features = ["serde"] }
+solana-hash = "4.6.0"
+solana-compute-budget-interface = "3.0.0"
+solana-signature = "3.5.0"
+# no-entrypoint: this plugin only builds instructions, never runs on-chain
+# program code — the entrypoint machinery isn't needed and doesn't belong in
+# a wasm component.
+spl-token = { version = "9.0.0", default-features = false, features = ["no-entrypoint"] }
+# Solana's own wire format for Message/Transaction is bincode — required to
+# get message_bytes to sign and to produce the final wire-format bytes.
+bincode = "1"
 
 [target.'cfg(target_family = "wasm")'.dependencies]
 waki = { version = "0.5.1", features = ["json"] }
