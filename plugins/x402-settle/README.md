@@ -215,6 +215,25 @@ two vectors specific to actually signing and paying:
 | 9 | Prompt injection via the 402 body's free-text fields | Only structural fields ever reach a policy decision; no code path from response prose to a spend decision | `rejects_prompt_injection_disguised_as_a_message_field` (`tests/adversarial.rs`) |
 | 10 | A single call going straight from "402 received" to "signed and submitted" | `confirm` requires a fresh, matching `approval_token` a prior `propose` call issued — one call alone can only ever produce a read-only proposal | `approval_token_rejects_a_different_amount_than_it_was_issued_for`, `approval_token_rejects_one_slot_past_expiry` (`src/x402_settle.rs`) |
 
+**Third-party trust: the facilitator (`extra.feePayer`).** When a server
+sponsors gas, this plugin hands it a partially-signed transaction — the
+facilitator adds its own fee-payer signature and broadcasts. That is a
+real third party in the trust boundary, and here is exactly what trusting
+it does and doesn't expose: it **cannot** redirect funds, change the
+amount, or substitute a different mint or destination, because doing so
+would change the message bytes and invalidate this plugin's own
+authority-slot signature (`signature_does_not_verify_against_a_tampered_amount`,
+`mismatched_fee_payer_pubkey_produces_a_transaction_that_fails_to_verify`
+— both in `tests/adversarial.rs`) — the transaction is cryptographically
+sealed on every field except who pays gas. It **can** withhold
+broadcasting a valid transaction (a griefing/availability risk, not a
+funds-safety one — the session key's tokens never leave until a
+`TransferChecked` actually lands) or, in principle, misreport gas costs
+it's covering. This plugin does not verify the facilitator's identity
+beyond taking whatever address the server's `extra.feePayer` names; an
+operator who doesn't trust a given server's chosen facilitator should not
+grant `x402-settle` a session key against that server.
+
 **Known limit on #8, found in a third-party audit (2026-07-24):** the
 cumulative cap is recomputed from on-chain history on every call, since the
 `tool-plugin` world gives `execute` a fresh store each time and holds no
