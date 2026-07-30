@@ -732,8 +732,19 @@ mod component {
                     PluginOutcome::Failure,
                     "server rejected payment proof",
                 );
+                // The body often carries the facilitator/server's real
+                // rejection reason (e.g. an x402-svm `invalidReason` code) —
+                // surfacing it is the difference between an operator seeing
+                // an actionable error and just "HTTP 402" with no context.
+                // Bounded and lossy-decoded for the same reason MAX_BODY_BYTES
+                // exists: this body is untrusted server input.
+                let body_excerpt = String::from_utf8_lossy(
+                    &final_resp.body[..final_resp.body.len().min(MAX_BODY_BYTES)],
+                )
+                .into_owned();
                 Ok(deny(format!(
-                    "transaction was signed and submitted but the server rejected it: HTTP {}",
+                    "transaction was signed and sent with proof of payment, but the server \
+                     rejected it: HTTP {} — {body_excerpt:?}",
                     final_resp.status
                 )))
             }
